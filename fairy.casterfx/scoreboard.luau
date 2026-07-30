@@ -1,27 +1,29 @@
 -- Scoreboard: static team-logo quads anchored to the arena, for covering the in-game
--- scoreboard crests.
+-- scoreboard crests. Arenas have two scoreboards, so the default is four slots
+-- (two boards x home/away), and the count is editable per profile.
 --
 -- Named scoreboard, not logos, because `require("logos")` resolves to the logos/ ASSET
 -- FOLDER rather than to this file. Do not rename it back.
 --
--- Placement is config-driven per arena type and edited live in the GUI, because the
--- scoreboard offset is not exposed anywhere in the API and differs per gamemode.
--- Nudge each slot into place once, hit Save, done.
+-- Placement is per profile, per arena type, and edited live in the GUI, because the
+-- scoreboard offsets are not exposed anywhere in the API and differ per gamemode. Fly the
+-- debug freecam up to a board and drag the sliders.
 --
--- The camera script cannot reach the internet (there is no HTTP client in the Luau API),
--- so images have to already be in logos/. get-logos.ps1 puts them there; this module
--- writes wanted.json with the team names it detected so that script knows what to fetch.
+-- The camera cannot reach the internet (there is no HTTP client in the Luau API), so images
+-- must already be in logos/. get-logos.ps1 puts them there, either from the ODC API or by
+-- importing whatever OD Caster Bridge already has.
 
 local Util = require("util")
+local Profiles = require("profiles")
 
-local Logos = {}
+local Scoreboard = {}
 
-local meshes = {}      -- "home" | "away" -> { mesh, texturePath }
+local meshes = {}      -- slot index -> { mesh, texturePath, flipU, flipV, needDraw }
 local textures = {}    -- path -> LuauTexture | false
 local fileList = {}
 local lastWanted = ""
 
-Logos.status = { home = "", away = "" }
+Scoreboard.status = {}   -- slot index -> reason string
 
 --------------------------------------------------------------------------------
 -- Files
@@ -33,24 +35,21 @@ local function isImage(path)
         or string.sub(lower, -5) == ".jpeg"
 end
 
-function Logos.rescan()
+function Scoreboard.rescan()
     fileList = {}
     textures = {}
     local ok, files = pcall(LuauFile.listFiles, "logos")
-    if not ok or files == nil then
-        -- listFiles on a missing folder: treat as empty rather than erroring out.
-        return fileList
-    end
-    for _, f in files do
-        if isImage(f) then table.insert(fileList, f) end
+    if ok and files ~= nil then
+        for _, f in files do
+            if isImage(f) then table.insert(fileList, f) end
+        end
     end
     table.sort(fileList)
-    -- Force a reload of whatever is currently applied.
     for _, m in pairs(meshes) do m.texturePath = nil end
     return fileList
 end
 
-function Logos.files()
+function Scoreboard.files()
     return fileList
 end
 
@@ -66,8 +65,7 @@ local function loadTexture(path)
     return tex
 end
 
--- listFiles returns paths that may or may not carry the folder prefix depending on
--- what was passed in, so match on the tail rather than assuming a shape.
+-- listFiles paths may or may not carry the folder prefix, so match on the filename tail.
 local function findFile(stem)
     local want = string.lower(stem)
     for _, f in fileList do
@@ -79,39 +77,36 @@ local function findFile(stem)
     return nil
 end
 
---------------------------------------------------------------------------------
--- Slots
---------------------------------------------------------------------------------
-
--- A slot is flat numbers so every field is a slider and the config stays JSON-simple.
-function Logos.defaultSlot(side, arenaHeight)
-    local sign = side == "home" and -1 or 1
-    return {
-        enabled = true,
-        x = 0,
-        y = sign * 340,
-        z = (arenaHeight or 1440) * 0.62,
-        pitch = 0,
-        yaw = 0,
-        roll = 0,
-        width = 260,
-        height = 260,
-        faceCamera = false,
-        flipU = false,
-        flipV = false,
-    }
+local function hasFile(path)
+    for _, f in fileList do
+        if f == path then return true end
+    end
+    return false
 end
 
-function Logos.slotsFor(arenaType, arenaHeight)
-    if config.logoSlots == nil then config.logoSlots = {} end
-    local key = arenaType or "unknown"
-    if config.logoSlots[key] == nil then
-        config.logoSlots[key] = {
-            home = Logos.defaultSlot("home", arenaHeight),
-            away = Logos.defaultSlot("away", arenaHeight),
-        }
+--------------------------------------------------------------------------------
+-- Which image goes on which slot
+--------------------------------------------------------------------------------
+
+-- Order matters. HOME/AWAY beats the team name on purpose: an ordinary lobby reports the
+-- SAME teamName for both sides, so a name-keyed lookup would put one crest on both boards.
+-- Caster Bridge stores its logos by side, and get-logos.ps1 -FromBridge writes them here as
+-- HOME.png / AWAY.png, which is unambiguous.
+local function resolvePath(side, teamName)
+    local profile = Profiles.active()
+    local override = profile.logoOverride and profile.logoOverride[side]
+    if override and override ~= "" then
+        return override, hasFile(override) and "override" or "override (missing?)"
     end
-    return config.logoSlots[key]
+
+    local bySide = findFile(string.upper(side))
+    if bySide then return bySide, "side: " .. string.upper(side) end
+
+    if teamName == nil or teamName == "" then return nil, "no logo for " .. side end
+    local stem = Util.sanitizeTeamName(teamName)
+    local found = findFile(stem)
+    if found then return found, "team: " .. stem end
+    return nil, "missing " .. stem .. ".png"
 end
 
 --------------------------------------------------------------------------------
@@ -132,33 +127,28 @@ local function buildQuad(flipU, flipV)
     return v, t, n, uv
 end
 
-local function ensureMesh(side, slot)
-    local m = meshes[side]
-    if m and m.flipU == slot.flipU and m.flipV == slot.flipV then return m end
-    if m then
-        -- UV flip changes geometry, which needs a redraw anyway; reuse the mesh.
+local function ensureMesh(index, slot)
+    local m = meshes[index]
+    if m == nil then
+        local mesh = WorldDraw.spawnMesh()
+        if mesh == nil then
+            issue("casterfx: spawnMesh() returned nil, cannot show logo slot " .. index)
+            return nil
+        end
+        m = { mesh = mesh, texturePath = nil, flipU = nil, flipV = nil, needDraw = true }
+        meshes[index] = m
+    end
+    if m.flipU ~= slot.flipU or m.flipV ~= slot.flipV then
         local v, t, n, uv = buildQuad(slot.flipU, slot.flipV)
         m.mesh.vertices = v; m.mesh.triangles = t; m.mesh.normals = n; m.mesh.uVs = uv
         m.flipU = slot.flipU; m.flipV = slot.flipV
         m.needDraw = true
-        return m
     end
-    local mesh = WorldDraw.spawnMesh()
-    if mesh == nil then
-        issue("casterfx: WorldDraw.spawnMesh() returned nil, cannot show " .. side .. " logo")
-        return nil
-    end
-    local v, t, n, uv = buildQuad(slot.flipU, slot.flipV)
-    mesh.vertices = v; mesh.triangles = t; mesh.normals = n; mesh.uVs = uv
-    mesh.color = LinearColor.White
-    mesh.scale = Vec3.zeroVector
-    m = { mesh = mesh, texturePath = nil, flipU = slot.flipU, flipV = slot.flipV, needDraw = true }
-    meshes[side] = m
     return m
 end
 
-local function hide(side)
-    local m = meshes[side]
+local function hide(index)
+    local m = meshes[index]
     if m then m.mesh.scale = Vec3.zeroVector end
 end
 
@@ -166,61 +156,38 @@ end
 -- Update
 --------------------------------------------------------------------------------
 
-local function hasFile(path)
-    for _, f in fileList do
-        if f == path then return true end
-    end
-    return false
-end
-
--- Which image should this side use? Manual override wins, then <TEAMNAME>.png.
-local function resolvePath(side, teamName)
-    local override = config.logoOverride and config.logoOverride[side]
-    if override and override ~= "" then
-        -- Still returned when absent: listFiles may be stale, and a failed load is cached.
-        return override, hasFile(override) and "override" or "override (missing?)"
-    end
-    if teamName == nil or teamName == "" then return nil, "no team name" end
-    local stem = Util.sanitizeTeamName(teamName)
-    local found = findFile(stem)
-    if found then return found, "auto: " .. stem end
-    return nil, "missing " .. stem .. ".png"
-end
-
-local function updateSide(side, team, slot, matchTransform)
+local function updateSlot(index, slot, match)
+    local team = slot.side == "home" and match.home or match.away
     if not slot.enabled then
-        hide(side)
-        Logos.status[side] = "disabled"
-        return
-    end
-    local path, why = resolvePath(side, team and team.name)
-    Logos.status[side] = why
-    if path == nil then
-        hide(side)
+        hide(index)
+        Scoreboard.status[index] = "hidden"
         return
     end
 
-    local m = ensureMesh(side, slot)
+    local path, why = resolvePath(slot.side, team and team.name)
+    Scoreboard.status[index] = why
+    if path == nil then
+        hide(index)
+        return
+    end
+
+    local m = ensureMesh(index, slot)
     if m == nil then return end
 
     if m.texturePath ~= path then
         local tex = loadTexture(path)
         if tex == nil then
-            hide(side)
-            Logos.status[side] = "load failed: " .. path
+            hide(index)
+            Scoreboard.status[index] = "load failed: " .. path
             return
         end
         m.mesh.texture = tex
         m.texturePath = path
         m.needDraw = true
     end
-    if m.needDraw then
-        m.mesh:draw()
-        m.needDraw = false
-    end
 
-    local rot = matchTransform.rotation
-    m.mesh.position = matchTransform.position + rot:rotateVector(Vec3.new(slot.x, slot.y, slot.z))
+    local rot = match.transform.rotation
+    m.mesh.position = match.transform.position + rot:rotateVector(Vec3.new(slot.x, slot.y, slot.z))
     if slot.faceCamera then
         m.mesh.rotation = camera.rotation
     else
@@ -228,25 +195,35 @@ local function updateSide(side, team, slot, matchTransform)
     end
     -- x is the quad normal, so only y/z carry size.
     m.mesh.scale = Vec3.new(1, slot.width * 0.5, slot.height * 0.5)
+
+    -- Draw AFTER the transform is set. A mesh first drawn at zero scale appears to stay
+    -- invisible for good, which is the same trap the particle pool hit.
+    if m.needDraw then
+        m.mesh:draw()
+        m.needDraw = false
+    end
 end
 
-function Logos.update(match)
-    if match == nil or config.logosEnabled == false then
-        hide("home"); hide("away")
-        Logos.status.home = match == nil and "no arena" or "disabled"
-        Logos.status.away = Logos.status.home
+function Scoreboard.update(match, enabled)
+    if match == nil or enabled == false then
+        for index in pairs(meshes) do hide(index) end
         return
     end
-    local slots = Logos.slotsFor(match.type, match.arenaHeight)
-    updateSide("home", match.home, slots.home, match.transform)
-    updateSide("away", match.away, slots.away, match.transform)
+    local slots = Profiles.slots(match.type, match.arenaHeight)
+    for index, slot in slots do
+        updateSlot(index, slot, match)
+    end
+    -- Slots removed from the profile leave their mesh behind; park it.
+    for index in pairs(meshes) do
+        if slots[index] == nil then hide(index) end
+    end
 end
 
 --------------------------------------------------------------------------------
 -- wanted.json -- the handshake with get-logos.ps1
 --------------------------------------------------------------------------------
 
-function Logos.writeWanted(match)
+function Scoreboard.writeWanted(match)
     if match == nil then return end
     local home = match.home and match.home.name or ""
     local away = match.away and match.away.name or ""
@@ -278,11 +255,12 @@ function Logos.writeWanted(match)
     LuauFile.saveText("wanted.json", text)
 end
 
-function Logos.destroy()
+function Scoreboard.destroy()
     for _, m in pairs(meshes) do m.mesh:destroy() end
     meshes = {}
     textures = {}
+    Scoreboard.status = {}
     lastWanted = ""
 end
 
-return Logos
+return Scoreboard

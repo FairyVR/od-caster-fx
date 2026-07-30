@@ -38,6 +38,7 @@ param(
     [switch] $Watch,
     [switch] $Refresh,
     [switch] $ListMatches,
+    [switch] $FromBridge,
 
     [string] $PackagePath = (Join-Path $PSScriptRoot 'fairy.casterfx'),
     [int]    $Size = 512,
@@ -178,6 +179,63 @@ function Get-Logo {
     return $true
 }
 
+# OD Caster Bridge (github.com/dennssen/OD_Caster_Bridge) already solves the hard half of this:
+# the caster uploads each team's crest through its UI, and it stores them BY SIDE at
+#   %APPDATA%\ODCasterBridge\logos\{home,away}\{side}_{unixtime}.{ext}
+# with the team names in data.json. Importing from there beats matching on teamName, because
+# an ordinary lobby reports the same teamName for both sides -- the Bridge knows which is which
+# because a human told it. Written out as HOME.png / AWAY.png, which the camera prefers.
+function Import-FromBridge {
+    $bridge = Join-Path $env:APPDATA 'ODCasterBridge'
+    if (-not (Test-Path $bridge)) {
+        Write-Warning "OD Caster Bridge data not found at $bridge -- is it installed and has it saved logos?"
+        return 0
+    }
+
+    $names = @{}
+    $dataPath = Join-Path $bridge 'data.json'
+    if (Test-Path $dataPath) {
+        try {
+            $data = Get-Content $dataPath -Raw | ConvertFrom-Json
+            foreach ($side in @('home', 'away')) {
+                if ($data.teams -and $data.teams.$side -and $data.teams.$side.name) {
+                    $names[$side] = $data.teams.$side.name
+                }
+            }
+        } catch {
+            Write-Warning "Could not parse $dataPath : $($_.Exception.Message)"
+        }
+    }
+
+    $imported = 0
+    foreach ($side in @('home', 'away')) {
+        $dir = Join-Path $bridge "logos\$side"
+        if (-not (Test-Path $dir)) { continue }
+        # The Bridge empties the folder on each upload, so there is normally exactly one file;
+        # take the newest regardless.
+        $file = Get-ChildItem $dir -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $file) { continue }
+
+        $dest = Join-Path $LogoDir ("{0}.png" -f $side.ToUpperInvariant())
+        try {
+            Save-SquarePng -Bytes ([System.IO.File]::ReadAllBytes($file.FullName)) -Path $dest -Edge $Size
+        } catch {
+            Write-Warning ("Could not convert {0}: {1}" -f $file.Name, $_.Exception.Message)
+            continue
+        }
+        $label = if ($names[$side]) { $names[$side] } else { '(name not set in Bridge)' }
+        Write-Host ("  {0,-5} {1}  ->  logos\{2}.png" -f $side, $label, $side.ToUpperInvariant()) -ForegroundColor Green
+        $imported++
+
+        # Also write it under the team name, so a name-keyed lookup works too.
+        if ($names[$side]) {
+            $stem = Get-Stem $names[$side]
+            Copy-Item $dest (Join-Path $LogoDir "$stem.png") -Force
+        }
+    }
+    return $imported
+}
+
 function Read-Wanted {
     $path = Join-Path $PackagePath 'wanted.json'
     if (-not (Test-Path $path)) { return @() }
@@ -200,7 +258,17 @@ if (-not (Test-Path $LogoDir)) {
     Write-Host "Created $LogoDir"
 }
 
-$index = Get-TeamIndex -Force:$Refresh
+if ($FromBridge) {
+    Write-Host "Importing logos from OD Caster Bridge..." -ForegroundColor Cyan
+    $n = Import-FromBridge
+    Write-Host ("{0} logo(s) imported." -f $n) -ForegroundColor Green
+    Write-Host '  Press "Rescan logos/ folder" in the camera GUI.'
+    if (-not $Watch) { return }
+}
+
+# The ODC index is only needed for name-based fetching, so don't pay for it in -FromBridge runs.
+$index = @()
+if (-not $FromBridge) { $index = Get-TeamIndex -Force:$Refresh }
 
 if ($ListMatches) {
     foreach ($q in $Team) {
@@ -214,6 +282,27 @@ if ($ListMatches) {
 }
 
 if ($Watch) {
+    if ($FromBridge) {
+        Write-Host "Watching OD Caster Bridge logo folders -- Ctrl+C to stop." -ForegroundColor Cyan
+        $lastStamp = ''
+        while ($true) {
+            $bridge = Join-Path $env:APPDATA 'ODCasterBridge\logos'
+            $stamp = ''
+            if (Test-Path $bridge) {
+                $stamp = (Get-ChildItem $bridge -Recurse -File |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 2 |
+                    ForEach-Object { "$($_.Name):$($_.LastWriteTimeUtc.Ticks)" }) -join '|'
+            }
+            if ($stamp -ne $lastStamp) {
+                $lastStamp = $stamp
+                Write-Host ("`n[{0}] Bridge logos changed" -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Cyan
+                [void] (Import-FromBridge)
+            }
+            Start-Sleep -Seconds $PollSeconds
+        }
+    }
+
     Write-Host "Watching $PackagePath\wanted.json -- Ctrl+C to stop." -ForegroundColor Cyan
     $seen = ''
     while ($true) {

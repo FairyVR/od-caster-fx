@@ -1,69 +1,35 @@
 -- Fairy Caster FX -- sideline camera, team logo overlays, and VFX for Orion Drift casting.
 --
 -- Two modes, decided by whether this script owns the camera:
---   ACTIVE  -- the sideline camera drives the view and the overlays render on top.
+--   ACTIVE  -- the sideline camera (or the debug freecam) drives the view, overlays on top.
 --   OVERLAY -- alwaysTick keeps it running while ANOTHER camera is active (Plutus
 --              Autocaster, freecam, anything). The camera is never written to.
 --
 -- It renders with meshes only, never WorldDraw lines, on purpose: other scripts call
 -- WorldDraw.clear() every frame (Plutus does) which would wipe our lines but leaves
 -- meshes alone. Do not add drawLine calls here.
+--
+-- Settings live in named profiles (Profiles module) because Orion Drift has several
+-- competitive arenas and each wants its own framing and logo placement.
 
 local Util = require("util")
 local Match = require("match")
+local Profiles = require("profiles")
 -- "scoreboard", not "logos": require("logos") resolves to the logos/ asset folder.
 local Scoreboard = require("scoreboard")
 local Particles = require("particles")
 local Effects = require("effects")
 local Sideline = require("sideline")
+local Freecam = require("freecam")
+local Diagnostics = require("diagnostics")
 
 Util.initializeConfig({
     logosEnabled = true,
-    logoOverride = { home = "", away = "" },
-    logoSlots = {},
     writeWanted = true,
-
-    vfxEnabled = true,
-    intensity = 1.0,
-    simSpeed = 1.0,
-    maxMeshes = 420,
-
-    goalEnabled = true,
-    goalShockwaves = true,
-    goalDebris = true,
-    goalSparks = true,
-    goalSprites = true,
-    goalLights = true,
-    lightIntensity = 1.0,
-    kickoffEnabled = true,
-    trailEnabled = true,
-    trailInterval = 0.03,
-    impactEnabled = true,
-    impactThreshold = 900,
-
     autoSelectArena = true,
-    showDebug = false,
-
-    -- Sideline camera. Only applies when this script is the active/followed camera.
-    camEnabled = true,
-    camSideDistance = 2600,
-    camLengthLimit = 2200,
-    camHeightOffset = 220,
-    camMaxHeight = 1250,
-    camMinHeightAboveGround = 130,
-    camRiserScale = 1.0,
-    camHookScale = 1.0,
-    camSwitchThreshold = 400,
-    camSwitchInstant = true,
-    camLead = 0.45,
-    camPositionSmoothing = 0.25,
-    camRotationSmoothing = 0.12,
-    camFovSmoothing = 0.2,
-    camAutoZoom = true,
-    camZoomFraction = 0.16,
-    camFovMin = 35,
-    camFovMax = 95,
-    camFovFixed = 70,
+    autoBindProfile = true,
+    freecamSpeed = 900,
+    freecamSensitivity = 0.25,
 })
 
 local matches = {}
@@ -76,49 +42,55 @@ local prevBallVelocity = Vec3.zeroVector
 local lastImpactTime = -99
 local totalTime = 0
 local selfTestResult = ""
+local newProfileName = ""
+
+-- Error handling. A raw error inside tick() kills the script for the rest of the session,
+-- which is how a goal flash can end up stuck on: the lights stop being decayed. Each phase
+-- is guarded so one bad frame degrades instead of stopping everything.
+local lastError = ""
+local errorCount = 0
+
+local function guard(name, fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        errorCount += 1
+        lastError = name .. ": " .. tostring(err)
+        -- Log the first few only; a per-frame error would otherwise flood the log.
+        if errorCount <= 5 then issue("casterfx " .. lastError) end
+    end
+    return ok
+end
 
 --------------------------------------------------------------------------------
 -- Wiring
 --------------------------------------------------------------------------------
 
 local function pushSettings()
-    Particles.enabled = config.vfxEnabled
-    Particles.simSpeed = config.simSpeed
-    Particles.maxMeshes = math.floor(config.maxMeshes)
-    local s = Effects.settings
-    s.intensity = config.intensity
-    s.goalEnabled = config.goalEnabled
-    s.goalShockwaves = config.goalShockwaves
-    s.goalDebris = config.goalDebris
-    s.goalSparks = config.goalSparks
-    s.goalSprites = config.goalSprites
-    s.goalLights = config.goalLights
-    s.lightIntensity = config.lightIntensity
-    s.kickoffEnabled = config.kickoffEnabled
-    s.trailEnabled = config.trailEnabled
-    s.trailInterval = config.trailInterval
-    s.impactEnabled = config.impactEnabled
+    local profile = Profiles.active()
+    Sideline.settings = profile.camera
 
-    local c = Sideline.settings
-    c.enabled = config.camEnabled
-    c.sideDistance = config.camSideDistance
-    c.lengthLimit = config.camLengthLimit
-    c.heightOffset = config.camHeightOffset
-    c.maxHeight = config.camMaxHeight
-    c.minHeightAboveGround = config.camMinHeightAboveGround
-    c.riserScale = config.camRiserScale
-    c.hookScale = config.camHookScale
-    c.switchThreshold = config.camSwitchThreshold
-    c.switchInstant = config.camSwitchInstant
-    c.lead = config.camLead
-    c.positionSmoothing = config.camPositionSmoothing
-    c.rotationSmoothing = config.camRotationSmoothing
-    c.fovSmoothing = config.camFovSmoothing
-    c.autoZoom = config.camAutoZoom
-    c.zoomFraction = config.camZoomFraction
-    c.fovMin = config.camFovMin
-    c.fovMax = config.camFovMax
-    c.fovFixed = config.camFovFixed
+    local v = profile.vfx
+    Particles.enabled = v.enabled
+    Particles.simSpeed = v.simSpeed
+    Particles.sizeScale = v.sizeScale
+    Particles.maxMeshes = math.floor(v.maxMeshes)
+
+    local s = Effects.settings
+    s.intensity = v.intensity
+    s.goalEnabled = v.goalEnabled
+    s.goalShockwaves = v.goalShockwaves
+    s.goalDebris = v.goalDebris
+    s.goalSparks = v.goalSparks
+    s.goalSprites = v.goalSprites
+    s.goalLights = v.goalLights
+    s.lightIntensity = v.lightIntensity
+    s.kickoffEnabled = v.kickoffEnabled
+    s.trailEnabled = v.trailEnabled
+    s.trailInterval = v.trailInterval
+    s.impactEnabled = v.impactEnabled
+
+    Freecam.speed = config.freecamSpeed
+    Freecam.lookSensitivity = config.freecamSensitivity
 end
 
 local function selectIndex(i)
@@ -130,6 +102,15 @@ local function selectIndex(i)
     -- old arena's ball velocity fire a phantom impact ring.
     Sideline.reset()
     prevBallVelocity = Vec3.zeroVector
+
+    -- Each competitive arena can have its own profile bound to it.
+    if config.autoBindProfile and selected then
+        local bound = Profiles.bindingFor(selected.slotId)
+        if bound then
+            Profiles.select(bound)
+            pushSettings()
+        end
+    end
 end
 
 local function refreshMatches(force)
@@ -149,7 +130,7 @@ end
 -- when a station hosts several courts. Skipped while we own the camera, since then the
 -- camera sits at the selected arena by construction and this could never move off it.
 local function autoSelect()
-    if #matches < 2 or Sideline.isDriving() then return end
+    if #matches < 2 or Sideline.isDriving() or Freecam.isDriving() then return end
     local pos = camera.position
     local bestIdx, bestDist = selectedIndex, math.huge
     for i, m in matches do
@@ -187,6 +168,7 @@ end
 function main()
     alwaysTick = true
     math.randomseed(math.floor(os.clock() * 1000) % 2147483647)
+    Profiles.ensure()
     pushSettings()
     Scoreboard.rescan()
     refreshMatches(true)
@@ -197,6 +179,7 @@ function onLoad()
 end
 
 function onConfigChanged()
+    Profiles.ensure()
     pushSettings()
 end
 
@@ -212,98 +195,202 @@ function tick(dt)
     refreshTimer += dt
     if refreshTimer > 3 then
         refreshTimer = 0
-        refreshMatches(false)
-        if config.autoSelectArena then autoSelect() end
+        guard("refreshMatches", refreshMatches, false)
+        if config.autoSelectArena then guard("autoSelect", autoSelect) end
     end
 
     if selected == nil then
-        Particles.update(dt)
+        guard("particles", Particles.update, dt)
         return
     end
 
-    selected:tick()
+    guard("match tick", function() selected:tick() end)
 
-    -- Before the overlays: billboarded particles and face-camera logos read camera.rotation,
-    -- so the camera has to be where it is going to be this frame first.
-    Sideline.update(dt, selected)
-
-    for _, event in selected.events do
-        if event.kind == "goal" then
-            Effects.goalExplosion(event.position, event.rotation, event.team.color)
-        elseif event.kind == "kickoff" then
-            Effects.kickoffBurst(event.position, selected.home.color, selected.away.color)
-        end
-    end
-
-    local ball = selected.ball
-    local trailColor = possessionColor(selected)
-    if ball then
-        local vel = ball.velocity or Vec3.zeroVector
-        Effects.ballTrail(dt, ball.transform.position, vel, trailColor)
-        -- A large velocity change in one frame is a hit, a wall, or a save.
-        local delta = (vel - prevBallVelocity):length()
-        if delta > config.impactThreshold and totalTime - lastImpactTime > 0.15 then
-            lastImpactTime = totalTime
-            local normal = (vel - prevBallVelocity):getSafeNormal()
-            Effects.impactRing(ball.transform.position, normal, trailColor)
-        end
-        prevBallVelocity = vel
+    -- Camera first: billboarded particles and face-camera logos read camera.rotation, so the
+    -- camera has to be where it is going to be this frame before the overlays are placed.
+    -- Freecam wins when enabled, so logo placement can be done by eye.
+    if Freecam.isDriving() then
+        guard("freecam", Freecam.update, dt, selected)
     else
-        Effects.resetTrail()
-        prevBallVelocity = Vec3.zeroVector
+        guard("sideline", Sideline.update, dt, selected)
     end
 
-    Scoreboard.update(selected)
+    guard("events", function()
+        for _, event in selected.events do
+            if event.kind == "goal" then
+                Effects.goalExplosion(event.position, event.rotation, event.team.color)
+            elseif event.kind == "kickoff" then
+                Effects.kickoffBurst(event.position, selected.home.color, selected.away.color)
+            end
+        end
+    end)
+
+    guard("ball effects", function()
+        local ball = selected.ball
+        local trailColor = possessionColor(selected)
+        if ball then
+            local vel = ball.velocity or Vec3.zeroVector
+            Effects.ballTrail(dt, ball.transform.position, vel, trailColor)
+            -- A large velocity change in one frame is a hit, a wall, or a save.
+            local delta = (vel - prevBallVelocity):length()
+            local threshold = Profiles.active().vfx.impactThreshold
+            if delta > threshold and totalTime - lastImpactTime > 0.15 then
+                lastImpactTime = totalTime
+                Effects.impactRing(ball.transform.position,
+                    (vel - prevBallVelocity):getSafeNormal(), trailColor)
+            end
+            prevBallVelocity = vel
+        else
+            Effects.resetTrail()
+            prevBallVelocity = Vec3.zeroVector
+        end
+    end)
+
+    guard("scoreboard", Scoreboard.update, selected, config.logosEnabled)
 
     if config.writeWanted then
         wantedTimer += dt
         if wantedTimer > 2 then
             wantedTimer = 0
-            Scoreboard.writeWanted(selected)
+            guard("writeWanted", Scoreboard.writeWanted, selected)
         end
     end
 
-    Particles.update(dt)
+    guard("particles", Particles.update, dt)
 end
 
 --------------------------------------------------------------------------------
 -- GUI
 --------------------------------------------------------------------------------
 
-local function slotEditor(label, side, slot)
-    if not Gui.treeNode(label) then return end
-    slot.enabled = Gui.checkbox("Show##" .. side, slot.enabled)
+local function modeBanner()
+    if Freecam.isDriving() then
+        Gui.textColored(LinearColor.new(0.5, 0.8, 1, 1),
+            "DEBUG FREECAM -- WASD move, R/F up-down, right-mouse look, Shift fast, Space snap to arena")
+    elseif Sideline.isDriving() then
+        Gui.textColored(LinearColor.new(0.4, 1, 0.4, 1), "Driving the camera (sideline).")
+    else
+        Gui.textColored(LinearColor.new(1, 0.8, 0.3, 1),
+            "Overlay mode -- another camera is active, so the view is not touched.")
+        Gui.text("Activate this camera in F2 to have it drive the shot.")
+    end
+end
+
+local function cameraTab()
+    local cam = Profiles.active().camera
+    modeBanner()
+    Gui.separator()
+
+    cam.enabled = Gui.checkbox("Enable sideline camera", cam.enabled)
+    Freecam.enabled = Gui.checkbox("Debug freecam (for placing logos)", Freecam.enabled)
+    if Freecam.enabled then
+        config.freecamSpeed = Gui.sliderFloat("Freecam speed", config.freecamSpeed, 100, 5000)
+        config.freecamSensitivity = Gui.sliderFloat("Look sensitivity",
+            config.freecamSensitivity, 0.02, 1.5)
+        if Gui.button(Icon.Crosshairs .. " Snap freecam to arena") then Freecam.snapTo(selected) end
+    end
+
+    Gui.text(string.format("Side %+d (blend %+.2f)   FOV %.0f   subject %.0f cm   lift %.0f",
+        Sideline.debug.side, Sideline.debug.blend, Sideline.debug.fov,
+        Sideline.debug.subject, Sideline.debug.groundLift))
+    if not Sideline.debug.hasBall then
+        Gui.text("No ball found -- framing the arena centre.")
+    end
+
+    Gui.separatorText("Framing")
+    cam.sideDistance = Gui.sliderFloat("Touchline distance", cam.sideDistance, 500, 8000)
+    cam.lengthLimit = Gui.sliderFloat("Track length limit", cam.lengthLimit, 0, 9000)
+    cam.heightOffset = Gui.sliderFloat("Height above ball", cam.heightOffset, -500, 1500)
+    cam.maxHeight = Gui.sliderFloat("Max height", cam.maxHeight, 0, 3000)
+    cam.minHeightAboveGround = Gui.sliderFloat("Min above floor", cam.minHeightAboveGround, 0, 600)
+
+    Gui.separatorText("Zoom -- frames the action, not the ball")
+    cam.autoZoom = Gui.checkbox("Auto zoom", cam.autoZoom)
+    cam.zoomFraction = Gui.sliderFloat("Action fills fraction of screen", cam.zoomFraction, 0.2, 1.2)
+    cam.subjectMin = Gui.sliderFloat("Min action size (cm)", cam.subjectMin, 200, 6000)
+    cam.subjectMax = Gui.sliderFloat("Max action size (cm)", cam.subjectMax, 500, 12000)
+    cam.subjectPadding = Gui.sliderFloat("Action padding", cam.subjectPadding, 1, 2.5)
+    cam.fovMin = Gui.sliderFloat("FOV min", cam.fovMin, 10, 170)
+    cam.fovMax = Gui.sliderFloat("FOV max", cam.fovMax, 10, 170)
+    cam.fovFixed = Gui.sliderFloat("Fixed FOV (auto zoom off)", cam.fovFixed, 10, 170)
+
+    Gui.separatorText("Smoothing")
+    cam.followSpeed = Gui.sliderFloat("Dolly follow speed", cam.followSpeed, 0.5, 20)
+    cam.aimSpeed = Gui.sliderFloat("Aim follow speed", cam.aimSpeed, 0.5, 30)
+    cam.lead = Gui.sliderFloat("Velocity lead (s)", cam.lead, 0, 1.5)
+    cam.positionSmoothing = Gui.sliderFloat("Engine position smoothing", cam.positionSmoothing, 0, 1)
+    cam.rotationSmoothing = Gui.sliderFloat("Engine rotation smoothing", cam.rotationSmoothing, 0, 1)
+    cam.fovSmoothing = Gui.sliderFloat("Engine FOV smoothing", cam.fovSmoothing, 0, 1.5)
+
+    Gui.separatorText("Side switching")
+    if Gui.beginCombo("Switch mode", cam.switchMode) then
+        for _, mode in { "smooth", "cut" } do
+            if Gui.selectable(mode, cam.switchMode == mode) then cam.switchMode = mode end
+        end
+        Gui.endCombo()
+    end
+    cam.switchSeconds = Gui.sliderFloat("Crossing time (s)", cam.switchSeconds, 0.1, 4)
+    cam.switchThreshold = Gui.sliderFloat("Switch threshold", cam.switchThreshold, 0, 3000)
+    cam.switchDwell = Gui.sliderFloat("Min time between switches (s)", cam.switchDwell, 0, 10)
+    if Gui.button(Icon.ExchangeAlt .. " Flip side now") then Sideline.flipSide() end
+
+    Gui.separatorText("Endzone behaviour")
+    cam.riserScale = Gui.sliderFloat("Riser strength", cam.riserScale, 0, 4)
+    cam.hookScale = Gui.sliderFloat("Inward hook strength", cam.hookScale, 0, 4)
+
+    Gui.separator()
+    if Gui.button(Icon.Save .. " Save profile") then
+        if saveConfig() then print("casterfx: saved profile " .. config.activeProfile) end
+    end
+end
+
+local function slotEditor(index, slot)
+    if not Gui.treeNode(string.format("%d. %s##slot%d", index, slot.name, index)) then return end
+
+    slot.name = Gui.inputText("Label##" .. index, slot.name)
+    slot.enabled = Gui.checkbox("Show##" .. index, slot.enabled)
     Gui.sameLine()
-    slot.faceCamera = Gui.checkbox("Face camera##" .. side, slot.faceCamera)
+    slot.faceCamera = Gui.checkbox("Face camera##" .. index, slot.faceCamera)
+    Gui.sameLine()
+    if Gui.beginCombo("Side##" .. index, slot.side) then
+        for _, side in { "home", "away" } do
+            if Gui.selectable(side, slot.side == side) then slot.side = side end
+        end
+        Gui.endCombo()
+    end
+    Gui.text("Status: " .. tostring(Scoreboard.status[index]))
 
     Gui.separatorText("Position (cm, arena-relative)")
-    slot.x = Gui.dragFloat("Forward X##" .. side, slot.x, 2, -20000, 20000)
-    slot.y = Gui.dragFloat("Right Y##" .. side, slot.y, 2, -20000, 20000)
-    slot.z = Gui.dragFloat("Up Z##" .. side, slot.z, 2, -5000, 5000)
+    slot.x = Gui.dragFloat("Forward X##" .. index, slot.x, 2, -20000, 20000)
+    slot.y = Gui.dragFloat("Right Y##" .. index, slot.y, 2, -20000, 20000)
+    slot.z = Gui.dragFloat("Up Z##" .. index, slot.z, 2, -5000, 5000)
+
+    if Freecam.isDriving() and selected then
+        if Gui.button(Icon.MapMarkerAlt .. " Put it where I'm looking##" .. index) then
+            local aim = Freecam.aimPoint(400)
+            if aim then
+                -- World point back into the arena's frame, which is what the slot stores.
+                local local_ = selected.transform.rotation:inverse()
+                    :rotateVector(aim - selected.transform.position)
+                slot.x, slot.y, slot.z = local_.x, local_.y, local_.z
+            end
+        end
+    end
 
     Gui.separatorText("Rotation (degrees)")
-    slot.roll = Gui.sliderFloat("Roll##" .. side, slot.roll, -180, 180)
-    slot.pitch = Gui.sliderFloat("Pitch##" .. side, slot.pitch, -180, 180)
-    slot.yaw = Gui.sliderFloat("Yaw##" .. side, slot.yaw, -180, 180)
+    slot.roll = Gui.sliderFloat("Roll##" .. index, slot.roll, -180, 180)
+    slot.pitch = Gui.sliderFloat("Pitch##" .. index, slot.pitch, -180, 180)
+    slot.yaw = Gui.sliderFloat("Yaw##" .. index, slot.yaw, -180, 180)
 
     Gui.separatorText("Size (cm)")
-    slot.width = Gui.dragFloat("Width##" .. side, slot.width, 1, 1, 4000)
-    slot.height = Gui.dragFloat("Height##" .. side, slot.height, 1, 1, 4000)
+    slot.width = Gui.dragFloat("Width##" .. index, slot.width, 1, 1, 4000)
+    slot.height = Gui.dragFloat("Height##" .. index, slot.height, 1, 1, 4000)
 
     Gui.separatorText("Texture orientation")
-    slot.flipU = Gui.checkbox("Flip horizontally##" .. side, slot.flipU)
+    slot.flipU = Gui.checkbox("Flip horizontally##" .. index, slot.flipU)
     Gui.sameLine()
-    slot.flipV = Gui.checkbox("Flip vertically##" .. side, slot.flipV)
+    slot.flipV = Gui.checkbox("Flip vertically##" .. index, slot.flipV)
 
-    if Gui.button(Icon.Copy .. " Mirror to other side##" .. side) then
-        local slots = Scoreboard.slotsFor(selected and selected.type, selected and selected.arenaHeight)
-        local other = side == "home" and slots.away or slots.home
-        other.x = slot.x; other.y = -slot.y; other.z = slot.z
-        other.roll = slot.roll; other.pitch = slot.pitch; other.yaw = -slot.yaw
-        other.width = slot.width; other.height = slot.height
-        other.flipU = slot.flipU; other.flipV = slot.flipV
-        other.faceCamera = slot.faceCamera
-    end
     Gui.treePop()
 end
 
@@ -316,195 +403,223 @@ local function logosTab()
     end
 
     Gui.text("Arena: " .. selected.name .. "  (" .. tostring(selected.type) .. ")")
-    Gui.text("Home: " .. (selected.home.name ~= "" and selected.home.name or "-")
-        .. "   [" .. Scoreboard.status.home .. "]")
-    Gui.text("Away: " .. (selected.away.name ~= "" and selected.away.name or "-")
-        .. "   [" .. Scoreboard.status.away .. "]")
+    Gui.text("Home: " .. (selected.home.name ~= "" and selected.home.name or "-"))
+    Gui.text("Away: " .. (selected.away.name ~= "" and selected.away.name or "-"))
 
-    -- Observed live: an ordinary lobby reports the same teamName for both sides, because
-    -- it is the in-game team name and not the ODC one. Auto-match cannot tell the sides
-    -- apart in that case, so say so instead of quietly showing one crest twice.
+    -- Observed live: an ordinary lobby reports the same teamName for both sides, because it is
+    -- the in-game team name and not the ODC one. HOME.png/AWAY.png sidestep it entirely.
     if selected.home.name ~= "" and selected.home.name == selected.away.name then
         Gui.textColored(LinearColor.new(1, 0.8, 0.3, 1),
-            "Both sides report the same team name -- set the overrides below.")
+            "Both sides report the same team name.")
+        Gui.text("Use HOME.png / AWAY.png (get-logos.ps1 -FromBridge) or the overrides below.")
     end
 
     Gui.separator()
-    if Gui.button(Icon.SyncAlt .. " Rescan logos/ folder") then
-        Scoreboard.rescan()
-    end
+    if Gui.button(Icon.SyncAlt .. " Rescan logos/ folder") then Scoreboard.rescan() end
     Gui.sameLine()
     Gui.text(#Scoreboard.files() .. " image(s) found")
-
     config.writeWanted = Gui.checkbox("Write wanted.json for get-logos.ps1", config.writeWanted)
 
-    Gui.separatorText("Manual override (blank = auto by team name)")
+    Gui.separatorText("Manual override (blank = auto)")
+    local profile = Profiles.active()
     local files = Scoreboard.files()
     for _, side in { "home", "away" } do
-        local current = config.logoOverride[side]
+        local current = profile.logoOverride[side] or ""
         if Gui.beginCombo(side == "home" and "Home image" or "Away image",
             current ~= "" and current or "(auto)") then
-            if Gui.selectable("(auto)", current == "") then config.logoOverride[side] = "" end
+            if Gui.selectable("(auto)", current == "") then profile.logoOverride[side] = "" end
             for _, f in files do
-                if Gui.selectable(f, current == f) then config.logoOverride[side] = f end
+                if Gui.selectable(f, current == f) then profile.logoOverride[side] = f end
             end
             Gui.endCombo()
         end
     end
 
-    Gui.separatorText("Placement -- nudge until it covers the in-game crest")
-    local slots = Scoreboard.slotsFor(selected.type, selected.arenaHeight)
-    slotEditor(Icon.Home .. " Home slot", "home", slots.home)
-    slotEditor(Icon.PlaneDeparture .. " Away slot", "away", slots.away)
+    Gui.separatorText("Slots -- one per logo, two scoreboards means four")
+    local slots = Profiles.slots(selected.type, selected.arenaHeight)
+    for index, slot in slots do
+        slotEditor(index, slot)
+    end
 
     Gui.separator()
-    if Gui.button(Icon.Save .. " Save placement") then
-        if saveConfig() then print("casterfx: placement saved") end
+    if Gui.button(Icon.Plus .. " Add slot") then
+        local index = #slots + 1
+        slots[index] = Profiles.defaultSlot(index, "home", selected.arenaHeight)
     end
     Gui.sameLine()
-    if Gui.button(Icon.Undo .. " Reset this arena") then
-        config.logoSlots[selected.type or "unknown"] = {
-            home = Scoreboard.defaultSlot("home", selected.arenaHeight),
-            away = Scoreboard.defaultSlot("away", selected.arenaHeight),
-        }
+    if Gui.button(Icon.Trash .. " Remove last slot") and #slots > 1 then
+        table.remove(slots)
+    end
+    Gui.sameLine()
+    if Gui.button(Icon.Undo .. " Reset all slots") then
+        Profiles.resetSlots(selected.type, selected.arenaHeight)
+    end
+
+    if Gui.button(Icon.Save .. " Save placement") then
+        if saveConfig() then print("casterfx: placement saved") end
     end
 end
 
 local function vfxTab()
-    config.vfxEnabled = Gui.checkbox("Enable VFX", config.vfxEnabled)
-    config.intensity = Gui.sliderFloat("Intensity", config.intensity, 0.1, 3)
-    config.simSpeed = Gui.sliderFloat("Sim speed", config.simSpeed, 0.1, 2)
-    config.maxMeshes = Gui.sliderInt("Mesh budget", math.floor(config.maxMeshes), 50, 1200)
+    local v = Profiles.active().vfx
+    v.enabled = Gui.checkbox("Enable VFX", v.enabled)
+    v.intensity = Gui.sliderFloat("Intensity (counts)", v.intensity, 0.1, 3)
+    v.sizeScale = Gui.sliderFloat("Particle size scale", v.sizeScale, 0.2, 12)
+    v.simSpeed = Gui.sliderFloat("Sim speed", v.simSpeed, 0.1, 2)
+    v.maxMeshes = Gui.sliderInt("Mesh budget", math.floor(v.maxMeshes), 50, 1200)
 
     Gui.separatorText("Goal explosion")
-    config.goalEnabled = Gui.checkbox("Goal explosion", config.goalEnabled)
-    config.goalShockwaves = Gui.checkbox("Shockwave rings", config.goalShockwaves)
-    config.goalDebris = Gui.checkbox("Debris shards", config.goalDebris)
-    config.goalSparks = Gui.checkbox("Sparks", config.goalSparks)
-    config.goalSprites = Gui.checkbox("Sprite flares", config.goalSprites)
-    config.goalLights = Gui.checkbox("Light flash", config.goalLights)
-    config.lightIntensity = Gui.sliderFloat("Light brightness", config.lightIntensity, 0, 3)
+    v.goalEnabled = Gui.checkbox("Goal explosion", v.goalEnabled)
+    v.goalShockwaves = Gui.checkbox("Shockwave rings", v.goalShockwaves)
+    v.goalDebris = Gui.checkbox("Debris shards", v.goalDebris)
+    v.goalSparks = Gui.checkbox("Sparks", v.goalSparks)
+    v.goalSprites = Gui.checkbox("Sprite flares", v.goalSprites)
+    v.goalLights = Gui.checkbox("Light flash", v.goalLights)
+    v.lightIntensity = Gui.sliderFloat("Light brightness", v.lightIntensity, 0, 2)
 
     Gui.separatorText("Other effects")
-    config.kickoffEnabled = Gui.checkbox("Kickoff burst", config.kickoffEnabled)
-    config.trailEnabled = Gui.checkbox("Ball trail", config.trailEnabled)
-    config.trailInterval = Gui.sliderFloat("Trail spacing (s)", config.trailInterval, 0.008, 0.15)
-    config.impactEnabled = Gui.checkbox("Impact rings", config.impactEnabled)
-    config.impactThreshold = Gui.sliderFloat("Impact threshold (cm/s)", config.impactThreshold, 200, 3000)
+    v.kickoffEnabled = Gui.checkbox("Kickoff burst", v.kickoffEnabled)
+    v.trailEnabled = Gui.checkbox("Ball trail", v.trailEnabled)
+    v.trailInterval = Gui.sliderFloat("Trail spacing (s)", v.trailInterval, 0.008, 0.15)
+    v.impactEnabled = Gui.checkbox("Impact rings", v.impactEnabled)
+    v.impactThreshold = Gui.sliderFloat("Impact threshold (cm/s)", v.impactThreshold, 200, 3000)
 
     Gui.separator()
     if Gui.button(Icon.Bomb .. " Test goal explosion") and selected then
-        local target = selected.away.goalPosition
-        local rot = selected.away.goalRotation
-        Effects.goalExplosion(target, rot, selected.home.color)
+        Effects.goalExplosion(selected.away.goalPosition, selected.away.goalRotation,
+            selected.home.color)
     end
     Gui.sameLine()
     if Gui.button(Icon.Rocket .. " Test kickoff") and selected then
         Effects.kickoffBurst(selected.transform.position, selected.home.color, selected.away.color)
     end
-    if Gui.button(Icon.Trash .. " Clear live particles") then
-        Particles.clear()
+    if Gui.button(Icon.Vial .. " Test burst in front of camera") then
+        Particles.testBurst()
     end
     Gui.sameLine()
-    if Gui.button(Icon.Save .. " Save VFX settings") then
-        if saveConfig() then print("casterfx: VFX settings saved") end
+    if Gui.button(Icon.Trash .. " Clear particles") then Particles.clear() end
+    Gui.sameLine()
+    if Gui.button(Icon.Lightbulb .. " Kill all lights") then Particles.clearLights() end
+
+    if Gui.button(Icon.Save .. " Save profile") then
+        if saveConfig() then print("casterfx: saved profile " .. config.activeProfile) end
     end
 end
 
-local function cameraTab()
-    config.camEnabled = Gui.checkbox("Enable sideline camera", config.camEnabled)
-    if Sideline.isDriving() then
-        Gui.textColored(LinearColor.new(0.4, 1, 0.4, 1), "Driving the camera.")
-    else
-        Gui.textColored(LinearColor.new(1, 0.8, 0.3, 1),
-            "Overlay mode -- another camera is active, so the view is not touched.")
-        Gui.text("Activate this camera in F2 to have it drive the shot.")
-    end
-    Gui.text(string.format("Side: %s   FOV: %.0f   Ground lift: %.0f",
-        Sideline.debug.side > 0 and "+" or "-", Sideline.debug.fov, Sideline.debug.groundLift))
-    if not Sideline.debug.hasBall then
-        Gui.text("No ball found -- framing the arena centre.")
+local function profilesTab()
+    Gui.text("Active profile: " .. tostring(config.activeProfile))
+    local names = Profiles.names()
+    if Gui.beginCombo("Profile", tostring(config.activeProfile)) then
+        for _, name in names do
+            if Gui.selectable(name, name == config.activeProfile) then
+                Profiles.select(name)
+                pushSettings()
+            end
+        end
+        Gui.endCombo()
     end
 
-    Gui.separatorText("Framing")
-    config.camSideDistance = Gui.sliderFloat("Touchline distance", config.camSideDistance, 500, 8000)
-    config.camLengthLimit = Gui.sliderFloat("Track length limit", config.camLengthLimit, 0, 9000)
-    config.camHeightOffset = Gui.sliderFloat("Height above ball", config.camHeightOffset, -500, 1500)
-    config.camMaxHeight = Gui.sliderFloat("Max height", config.camMaxHeight, 0, 3000)
-    config.camMinHeightAboveGround = Gui.sliderFloat("Min above floor",
-        config.camMinHeightAboveGround, 0, 600)
+    Gui.separatorText("Manage")
+    newProfileName = Gui.inputText("Name", newProfileName)
+    if Gui.button(Icon.Plus .. " Create") then
+        if Profiles.create(newProfileName) then newProfileName = "" ; pushSettings() end
+    end
+    Gui.sameLine()
+    if Gui.button(Icon.Copy .. " Duplicate active") then
+        if Profiles.create(newProfileName, config.activeProfile) then
+            newProfileName = ""
+            pushSettings()
+        end
+    end
+    Gui.sameLine()
+    if Gui.button(Icon.Edit .. " Rename active") then
+        if Profiles.rename(config.activeProfile, newProfileName) then newProfileName = "" end
+    end
+    Gui.sameLine()
+    if Gui.button(Icon.Trash .. " Delete active") then
+        if Profiles.delete(config.activeProfile) then pushSettings() end
+    end
+    if #names <= 1 then Gui.text("(the last profile cannot be deleted)") end
 
-    Gui.separatorText("Endzone behaviour")
-    config.camRiserScale = Gui.sliderFloat("Riser strength", config.camRiserScale, 0, 4)
-    config.camHookScale = Gui.sliderFloat("Inward hook strength", config.camHookScale, 0, 4)
-
-    Gui.separatorText("Side switching")
-    config.camSwitchThreshold = Gui.sliderFloat("Switch threshold",
-        config.camSwitchThreshold, 0, 3000)
-    config.camSwitchInstant = Gui.checkbox("Hard cut on switch", config.camSwitchInstant)
-    if Gui.button(Icon.ExchangeAlt .. " Flip side now") then Sideline.flipSide() end
-
-    Gui.separatorText("Aim and smoothing")
-    config.camLead = Gui.sliderFloat("Velocity lead (s)", config.camLead, 0, 1.5)
-    config.camPositionSmoothing = Gui.sliderFloat("Position smoothing",
-        config.camPositionSmoothing, 0, 1.5)
-    config.camRotationSmoothing = Gui.sliderFloat("Rotation smoothing",
-        config.camRotationSmoothing, 0, 1.5)
-    config.camFovSmoothing = Gui.sliderFloat("FOV smoothing", config.camFovSmoothing, 0, 1.5)
-
-    Gui.separatorText("Zoom")
-    config.camAutoZoom = Gui.checkbox("Auto zoom", config.camAutoZoom)
-    config.camZoomFraction = Gui.sliderFloat("Ball screen fraction",
-        config.camZoomFraction, 0.02, 0.6)
-    config.camFovMin = Gui.sliderFloat("FOV min", config.camFovMin, 1, 170)
-    config.camFovMax = Gui.sliderFloat("FOV max", config.camFovMax, 1, 170)
-    config.camFovFixed = Gui.sliderFloat("Fixed FOV", config.camFovFixed, 1, 170)
+    Gui.separatorText("Arena binding")
+    config.autoBindProfile = Gui.checkbox("Auto-select profile per arena", config.autoBindProfile)
+    if selected then
+        local bound = Profiles.bindingFor(selected.slotId)
+        Gui.text("Arena " .. selected.slotId .. " -> " .. (bound or "(unbound)"))
+        if Gui.button(Icon.Link .. " Bind this arena to the active profile") then
+            Profiles.bind(selected.slotId, config.activeProfile)
+        end
+        Gui.sameLine()
+        if Gui.button(Icon.Unlink .. " Unbind") then Profiles.bind(selected.slotId, nil) end
+    end
 
     Gui.separator()
-    if Gui.button(Icon.Save .. " Save camera settings") then
-        if saveConfig() then print("casterfx: camera settings saved") end
+    if Gui.button(Icon.Save .. " Save all profiles") then
+        if saveConfig() then print("casterfx: profiles saved") end
     end
 end
 
 local function debugTab()
-    Gui.text("Arenas detected: " .. #matches)
-    config.autoSelectArena = Gui.checkbox("Auto-select nearest arena", config.autoSelectArena)
-    if #matches > 0 then
-        if Gui.beginCombo("Arena", selected and selected.name or "-") then
-            for i, m in matches do
-                if Gui.selectable(m.name, i == selectedIndex) then selectIndex(i) end
-            end
-            Gui.endCombo()
-        end
-    end
-    if Gui.button(Icon.SyncAlt .. " Re-scan gamemodes") then refreshMatches(true) end
-
-    Gui.separator()
-    local st = Particles.stats
-    Gui.text("Particles live: " .. st.live)
-    Gui.text("Meshes pooled: " .. st.meshes .. " / " .. math.floor(config.maxMeshes))
-    Gui.text("Mesh draws: " .. st.draws .. "   recycled: " .. st.dropped)
-    if selected then
-        Gui.text("Slot: " .. selected.slotId)
-        Gui.text("Running: " .. tostring(selected.isRunning)
-            .. "   Score: " .. selected.home.score .. " - " .. selected.away.score)
-        Gui.text("Ball: " .. (selected.ball and "yes" or "no"))
-        Gui.text("Home goal: " .. tostring(selected.home.goalPosition))
-        Gui.text("Away goal: " .. tostring(selected.away.goalPosition))
+    if lastError ~= "" then
+        Gui.textColored(LinearColor.new(1, 0.4, 0.4, 1), "Last error (" .. errorCount .. "): " .. lastError)
+        if Gui.button(Icon.Times .. " Clear error") then lastError = ""; errorCount = 0 end
+        Gui.separator()
     end
 
-    Gui.separator()
-    if Gui.button(Icon.Vial .. " Run self-test") then
+    Gui.separatorText("In-game diagnostics")
+    Gui.text("Writes diagnostics.json into the package folder, with live arena, ball,")
+    Gui.text("team, framing and mesh-capability data.")
+    if Gui.button(Icon.Stethoscope .. " Run diagnostics against live data") then
+        guard("diagnostics", Diagnostics.run, selected)
+    end
+    if Diagnostics.lastSummary ~= "" then
+        local colour = Diagnostics.lastFailed == 0
+            and LinearColor.new(0.4, 1, 0.4, 1) or LinearColor.new(1, 0.6, 0.3, 1)
+        Gui.textColored(colour, "Diagnostics: " .. Diagnostics.lastSummary)
+    end
+    if Gui.button(Icon.Vial .. " Run particle self-test") then
         local _, msg = Particles.selfTest()
         selfTestResult = msg
     end
     if selfTestResult ~= "" then Gui.text("Self-test: " .. selfTestResult) end
+
+    Gui.separatorText("Arenas")
+    Gui.text("Detected: " .. #matches)
+    config.autoSelectArena = Gui.checkbox("Auto-select nearest arena", config.autoSelectArena)
+    if #matches > 0 and Gui.beginCombo("Arena", selected and selected.name or "-") then
+        for i, m in matches do
+            if Gui.selectable(m.name, i == selectedIndex) then selectIndex(i) end
+        end
+        Gui.endCombo()
+    end
+    if Gui.button(Icon.SyncAlt .. " Re-scan gamemodes") then refreshMatches(true) end
+
+    Gui.separatorText("Runtime")
+    local st = Particles.stats
+    Gui.text("Particles live: " .. st.live .. "   meshes: " .. st.meshes
+        .. " / " .. math.floor(Profiles.active().vfx.maxMeshes))
+    Gui.text("Draws: " .. st.draws .. "   recycled: " .. st.dropped .. "   lights: " .. st.lights)
+    if Particles.meshSpawnFailed() then
+        Gui.textColored(LinearColor.new(1, 0.4, 0.4, 1),
+            "spawnMesh() returned nil -- no meshes can be drawn at all.")
+    end
+    if selected then
+        Gui.text("Slot: " .. selected.slotId .. "   running: " .. tostring(selected.isRunning))
+        Gui.text("Score: " .. selected.home.score .. " - " .. selected.away.score)
+        Gui.text("Ball: " .. (selected.ball and "yes" or "no"))
+        Gui.text("Home goal: " .. tostring(selected.home.goalPosition))
+        Gui.text("Away goal: " .. tostring(selected.away.goalPosition))
+    end
 end
 
 function onGui()
-    Gui.text(Sideline.isDriving()
-        and "Fairy Caster FX -- driving the camera"
-        or "Fairy Caster FX -- overlay mode, another camera is active")
+    if Freecam.isDriving() then
+        Gui.text("Fairy Caster FX -- debug freecam")
+    elseif Sideline.isDriving() then
+        Gui.text("Fairy Caster FX -- driving the camera")
+    else
+        Gui.text("Fairy Caster FX -- overlay mode, another camera is active")
+    end
     Gui.separator()
     if not Gui.beginTabBar("casterfx") then return end
     if Gui.beginTabItem(Icon.Video .. " Camera") then
@@ -517,6 +632,10 @@ function onGui()
     end
     if Gui.beginTabItem(Icon.Fire .. " VFX") then
         vfxTab()
+        Gui.endTabItem()
+    end
+    if Gui.beginTabItem(Icon.UserCog .. " Profiles") then
+        profilesTab()
         Gui.endTabItem()
     end
     if Gui.beginTabItem(Icon.Bug .. " Debug") then

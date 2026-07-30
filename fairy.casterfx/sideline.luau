@@ -4,49 +4,33 @@
 -- mode it never touches the camera, so it composes with Plutus Autocaster and friends.
 --
 -- Geometry follows yuki's od-sideline-cam (https://github.com/vrdeeznuts/od-sideline-cam):
--- project the ball into the arena frame, dolly along the touchline, switch sides with
--- hysteresis, rise and hook inward near the endzones, raycast down to stay above the floor,
--- and lead the aim by ball velocity.
+-- project the ball into the arena frame, dolly along the touchline, rise and hook inward near
+-- the endzones, raycast down to stay above the floor, and lead the aim by ball velocity.
 --
--- The difference: that script hardcodes arena centres and slot ids, which its author called
--- the hardest part to maintain. This one takes the frame from the gamemode's own
--- ModuleStateSpectatorLuaApi.transform, so it works on any arena the client reports,
--- including Ares servers, with nothing to update.
+-- Two deliberate departures:
+--   * The frame comes from the gamemode's own ModuleStateSpectatorLuaApi.transform instead of
+--     hardcoded arena centres and slot ids -- the part its author called hardest to maintain.
+--   * Auto zoom frames the ACTION (ball plus nearby players), not the ball. Framing a 35cm
+--     ball at a sane screen fraction from 26m out asks for a ~5 degree FOV, so a ball-framing
+--     zoom just sits pinned at whatever the minimum FOV is.
 
 local Util = require("util")
 
 local Sideline = {}
 
-Sideline.settings = {
-    enabled = true,
-    sideDistance = 2600,      -- cm from the centre line out to the touchline
-    lengthLimit = 2200,       -- how far along the arena the dolly tracks the ball
-    heightOffset = 220,       -- cm above the ball
-    maxHeight = 1250,
-    minHeightAboveGround = 130,
-    riserScale = 1.0,         -- endzone riser strength (quadratic in length)
-    hookScale = 1.0,          -- endzone inward hook strength
-    switchThreshold = 400,    -- ball must cross this far past centre to switch sides
-    switchInstant = true,     -- hard cut on a side switch instead of sweeping through play
-    lead = 0.45,              -- seconds of ball velocity to aim ahead
-    positionSmoothing = 0.25,
-    rotationSmoothing = 0.12,
-    fovSmoothing = 0.2,
-    autoZoom = true,
-    zoomFraction = 0.16,      -- ball diameter as a fraction of vertical screen height
-    fovMin = 35,
-    fovMax = 95,
-    fovFixed = 70,            -- used when autoZoom is off
+Sideline.settings = {}          -- filled from the active profile by main
+Sideline.debug = {
+    side = 1, blend = 1, fov = 90, groundLift = 0,
+    hasBall = false, subject = 0, dwell = 0,
 }
 
-local BALL_DIAMETER = 35      -- cm; ball radius is 17.5
-
-local currentSide = 1
-local previousSide = 1
-local activeFov = 70
+local sideTarget = 1            -- which touchline we want to be on (-1 / +1)
+local sideBlend = 1             -- where we actually are; animated for a smooth crossing
+local dwellTimer = 0
+local smoothDolly = nil
+local smoothLook = nil
+local activeFov = 90
 local wasDriving = false
-
-Sideline.debug = { side = 1, fov = 70, groundLift = 0, hasBall = false }
 
 -- Arena basis. Goals sit along the arena's own Y axis (Plutus rotates its goal offset by
 -- yaw +/-90 to reach them), so Y is the length axis and X is the width axis.
@@ -60,16 +44,40 @@ end
 -- Vertical FOV that makes an object of `diameter` at `distance` fill `frac` of the screen.
 local function fovForScreenSize(distance, diameter, frac)
     if distance < 1 or frac <= 0 then return Sideline.settings.fovFixed end
-    local visibleHeight = diameter / frac
-    return math.deg(2 * math.atan((visibleHeight * 0.5) / distance))
+    return math.deg(2 * math.atan(diameter / (2 * frac * distance)))
 end
 
-local function autoSwitchSides(widthOffset)
+-- How big is the action? Radius of the players clustered around the ball, so the FOV opens up
+-- for a scramble and tightens for a solo run.
+local function subjectDiameter(match, ballPos)
     local s = Sideline.settings
-    if currentSide == 1 and widthOffset < -s.switchThreshold then
-        currentSide = -1
-    elseif currentSide == -1 and widthOffset > s.switchThreshold then
-        currentSide = 1
+    local radius = 0
+    local frame_ = getGameData()
+    if frame_ and ballPos then
+        for _, p in frame_.players do
+            if p.teamIndex ~= Util.TeamIndex.NoTeam then
+                local d = Util.dist(ballPos, p.head.position)
+                -- Ignore players on the far side of the station, or in another arena.
+                if d < s.subjectMax and d > radius then radius = d end
+            end
+        end
+    end
+    return math.clamp(radius * 2 * s.subjectPadding, s.subjectMin, s.subjectMax)
+end
+
+local function updateSideTarget(widthOffset, dt)
+    local s = Sideline.settings
+    dwellTimer = math.max(0, dwellTimer - dt)
+    if dwellTimer > 0 then return end
+    local wanted = sideTarget
+    if sideTarget == 1 and widthOffset < -s.switchThreshold then
+        wanted = -1
+    elseif sideTarget == -1 and widthOffset > s.switchThreshold then
+        wanted = 1
+    end
+    if wanted ~= sideTarget then
+        sideTarget = wanted
+        dwellTimer = s.switchDwell
     end
 end
 
@@ -95,9 +103,7 @@ end
 -- Push the dolly up if it ended up inside or under the floor.
 local function liftAboveGround(pos, up)
     local s = Sideline.settings
-    local rayStart = pos + up * 600
-    local rayEnd = pos - up * 5000
-    local hit = camera:castRay(rayStart, rayEnd)
+    local hit = camera:castRay(pos + up * 600, pos - up * 5000)
     if not hit or not hit.successful then return pos, 0 end
     local floorHeight = hit.position:dot(up) + s.minHeightAboveGround
     local currentHeight = pos:dot(up)
@@ -108,7 +114,8 @@ end
 
 -- True when this script owns the camera. In overlay mode we must not write to it at all.
 function Sideline.isDriving()
-    return Sideline.settings.enabled and (camera.isActive or camera.isFollowed)
+    local s = Sideline.settings
+    return s.enabled == true and (camera.isActive or camera.isFollowed)
 end
 
 function Sideline.update(dt, match)
@@ -127,85 +134,109 @@ function Sideline.update(dt, match)
 
     -- No ball (warmup, between rounds, empty court): frame the arena so that picking an
     -- arena visibly does something instead of leaving the camera parked.
-    local lookTarget
+    local rawLook
     local widthOffset, lengthOffset, heightOffset
     if ballPos then
         local rel = ballPos - origin
         widthOffset = rel:dot(widthAxis)
         lengthOffset = rel:dot(lengthAxis)
         heightOffset = rel:dot(up)
-        autoSwitchSides(widthOffset)
-        lookTarget = ballPos + ballVel * s.lead
+        updateSideTarget(widthOffset, dt)
+        rawLook = ballPos + ballVel * s.lead
     else
         widthOffset, lengthOffset, heightOffset = 0, 0, 0
-        lookTarget = origin + up * 300
+        rawLook = origin + up * 300
     end
     Sideline.debug.hasBall = ballPos ~= nil
+
+    -- Animate the crossing instead of teleporting. sideBlend runs continuously between the
+    -- two touchlines, so a switch is a move rather than a jump cut.
+    if s.switchMode == "cut" then
+        sideBlend = sideTarget
+    else
+        local speed = 4 / math.max(s.switchSeconds, 0.05)
+        sideBlend = Util.damp(sideBlend, sideTarget, speed, dt)
+    end
 
     local hookWidth, hookLength = hookAdjust(lengthOffset)
     local lengthSign = lengthOffset >= 0 and 1 or -1
 
-    local dollyWidth = currentSide * s.sideDistance - hookWidth * currentSide
+    local dollyWidth = sideBlend * s.sideDistance - hookWidth * sideBlend
     local dollyLength = math.clamp(lengthOffset, -s.lengthLimit, s.lengthLimit)
         - hookLength * lengthSign
     local dollyHeight = math.clamp(
         heightOffset + s.heightOffset + riserAdjust(lengthOffset), -85, s.maxHeight)
 
-    local dollyPos = origin
+    local rawDolly = origin
         + widthAxis * dollyWidth
         + lengthAxis * dollyLength
         + up * dollyHeight
 
     local lift
-    dollyPos, lift = liftAboveGround(dollyPos, up)
+    rawDolly, lift = liftAboveGround(rawDolly, up)
     Sideline.debug.groundLift = lift
 
-    -- Field of view
-    local targetFov = s.fovFixed
-    if s.autoZoom and ballPos then
-        targetFov = math.clamp(
-            fovForScreenSize(Util.dist(dollyPos, ballPos), BALL_DIAMETER, s.zoomFraction),
-            s.fovMin, s.fovMax)
+    -- Hard cut only when taking over the camera or on an explicit cut-mode switch. Otherwise
+    -- damp our own targets: the engine's smoothing was chasing a noisy target, which is what
+    -- made this feel jittery rather than smooth.
+    local takingOver = not wasDriving
+    if takingOver or smoothDolly == nil then
+        smoothDolly = rawDolly
+        smoothLook = rawLook
+    else
+        smoothDolly = Util.dampVec3(smoothDolly, rawDolly, s.followSpeed, dt)
+        smoothLook = Util.dampVec3(smoothLook, rawLook, s.aimSpeed, dt)
     end
-    activeFov = targetFov
 
-    -- Cut instantly on a side switch or on taking over the camera, otherwise the dolly
-    -- sweeps straight through the middle of play, or drifts in from wherever it was.
-    local hardCut = (s.switchInstant and currentSide ~= previousSide) or not wasDriving
-    if hardCut then
+    if takingOver then
         camera.positionSmoothing = 0
         camera.rotationSmoothing = 0
         camera.fieldOfViewSmoothing = 0
-        if ballPos then lookTarget = ballPos end
     else
         camera.positionSmoothing = s.positionSmoothing
         camera.rotationSmoothing = s.rotationSmoothing
         camera.fieldOfViewSmoothing = s.fovSmoothing
     end
-    previousSide = currentSide
     wasDriving = true
 
+    -- Field of view
+    local subject = subjectDiameter(match, ballPos)
+    Sideline.debug.subject = subject
+    local targetFov = s.fovFixed
+    if s.autoZoom then
+        targetFov = math.clamp(
+            fovForScreenSize(Util.dist(smoothDolly, smoothLook), subject, s.zoomFraction),
+            math.min(s.fovMin, s.fovMax), math.max(s.fovMin, s.fovMax))
+    end
+    activeFov = targetFov
+
     -- lookAt with an up vector parallel to the view direction gimbal-locks.
-    local viewDir = (lookTarget - dollyPos):getSafeNormal()
+    local viewDir = (smoothLook - smoothDolly):getSafeNormal()
     local safeUp = up
     if math.abs(viewDir:dot(up)) > 0.999 then safeUp = widthAxis end
 
-    camera.position = dollyPos
-    camera:lookAt(lookTarget, safeUp)
+    camera.position = smoothDolly
+    camera:lookAt(smoothLook, safeUp)
     camera.fieldOfView = activeFov
 
-    Sideline.debug.side = currentSide
+    Sideline.debug.side = sideTarget
+    Sideline.debug.blend = sideBlend
     Sideline.debug.fov = activeFov
+    Sideline.debug.dwell = dwellTimer
 end
 
 -- Called when the arena changes, so the next frame cuts rather than sweeping across
 -- the station from the old arena.
 function Sideline.reset()
     wasDriving = false
+    smoothDolly = nil
+    smoothLook = nil
+    dwellTimer = 0
 end
 
 function Sideline.flipSide()
-    currentSide = -currentSide
+    sideTarget = -sideTarget
+    dwellTimer = Sideline.settings.switchDwell or 0
 end
 
 return Sideline

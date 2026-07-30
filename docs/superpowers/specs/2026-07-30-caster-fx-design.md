@@ -144,6 +144,51 @@ a single-frame ball velocity delta over a threshold.
 
 All counts scale with one `intensity` slider; each effect has an on/off toggle.
 
+## Revision 2: first in-game run
+
+Feedback: FOV too small, camera not smooth (especially crossing sidelines), no visible
+particles ("it just lit up the goal"), a goal light that stayed on, no way to place logos by
+eye, only two logo slots when arenas have two scoreboards.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| FOV too small | Auto zoom framed the **ball**. At 2600 cm, a 35 cm ball at 16% of screen height asks for `2·atan(109/2600)` ≈ **4.8°**, so FOV sat pinned at `fovMin` every frame. | Frame the **action** — radius of players clustered around the ball, clamped to `subjectMin/Max`. Defaults raised (`fovFixed` 90, `fovMin` 60). |
+| Not smooth | Engine smoothing was chasing a target that jittered frame to frame. | Damp our own dolly and aim targets (`followSpeed`, `aimSpeed`), engine smoothing reduced to a light second pass. |
+| Sideline crossing harsh | `switchInstant` hard-cut by default. | `sideBlend` animates continuously between touchlines (`switchMode = "smooth"`, `switchSeconds`), plus a `switchDwell` minimum so it cannot oscillate. `"cut"` still available. |
+| No visible particles | Pool meshes were `draw()`n at creation while parked at **zero scale and origin**; a mesh first drawn that way appears never to render. Lights worked because they are not meshes. | Draw only after position/rotation/scale are set, and redraw whenever a parked entry is reused. Same trap fixed in the logo quads. Added `sizeScale` (default 2.5) since everything is seen from ~26 m. |
+| Goal light stayed on | Most likely a raw error later in `tick()` killing the script, so lights were never decayed. | Every tick phase runs under `pcall` with the error surfaced in the Debug tab; light count hard-capped; explicit "Kill all lights" calling `WorldDraw.clearLights()`. |
+| Can't place logos | No manual camera. | `freecam.luau` — WASD/RF/right-mouse, Shift fast, Space snaps to the arena, plus "Put it where I'm looking" which converts the aim point into the slot's arena-relative offset. |
+| Two scoreboards | Slots were hardcoded home/away. | Slots are a list, default four (2 boards × 2 sides), each with its own side assignment; add/remove freely. |
+
+### Profiles
+
+Orion Drift has several competitive arenas, so settings are now named profiles
+(`profiles.luau`) holding camera settings, VFX settings, logo slots per arena type, and logo
+overrides. `config.bindings` maps a gamemode `slotId` to a profile, so walking into an arena
+can select its profile automatically. Modules read `Profiles.active()` rather than `config`,
+so switching profile switches everything with no copying.
+
+### In-game diagnostics
+
+`diagnostics.luau` runs against live game data and writes `diagnostics.json` into the package
+folder — which is readable from outside the game, closing the feedback loop that made the
+first round guesswork. It probes what cannot be reasoned about: whether `spawnMesh` and
+`spawnPointLight` actually return objects, whether a point light's `intensity` is writable
+(if not, a decaying flash could never dim), whether textures decode, plus the live arena
+transform, ball, team data, goal span, and the exact auto-zoom arithmetic.
+
+### Caster Bridge integration
+
+[OD Caster Bridge](https://github.com/dennssen/OD_Caster_Bridge) already solves the harder
+half of the logo problem. It stores crests **by side** at
+`%APPDATA%\ODCasterBridge\logos\{home,away}\{side}_{unixtime}.{ext}`, with team names in
+`data.json` (`CasterTeam { name, logoUrl }`). It serves them over HTTP for OBS overlays, which
+is useless here — the camera has no HTTP client — but the files on disk are exactly what is
+needed. `get-logos.ps1 -FromBridge` imports them as `HOME.png` / `AWAY.png` (and under the
+team name), and the camera prefers side-keyed files over name-keyed ones. That sidesteps the
+duplicate-team-name problem entirely: the Bridge knows which side is which because a human
+told it.
+
 ## Team names are not ODC team names
 
 Observed live, from `wanted.json` written by a real session:

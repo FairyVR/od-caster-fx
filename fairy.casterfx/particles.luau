@@ -15,10 +15,12 @@ local Util = require("util")
 local Particles = {}
 
 Particles.maxMeshes = 420   -- hard ceiling on pooled meshes
+Particles.maxLights = 6     -- point lights are the one effect that was definitely visible
 Particles.simSpeed = 1
 Particles.intensity = 1
+Particles.sizeScale = 2.5   -- everything is viewed from ~26m; unscaled particles are specks
 Particles.enabled = true
-Particles.stats = { live = 0, meshes = 0, draws = 0, dropped = 0 }
+Particles.stats = { live = 0, meshes = 0, draws = 0, dropped = 0, lights = 0 }
 
 local live = {}          -- active particles (unordered; swap-removed)
 local freeByShape = {}   -- shape -> { entry }
@@ -124,6 +126,10 @@ end
 -- Pool
 --------------------------------------------------------------------------------
 
+-- Geometry is assigned here but draw() is deliberately NOT called yet: a mesh drawn while
+-- parked at zero scale and origin position appears to never render afterwards, which is the
+-- most likely reason the first version produced light flashes and no visible particles at all.
+-- Every spawn now draws after the transform is set. See `parked` below.
 local function createEntry(shape)
     if meshSpawnFailed or #entries >= Particles.maxMeshes then return nil end
     local mesh = WorldDraw.spawnMesh()
@@ -140,16 +146,24 @@ local function createEntry(shape)
     mesh.color = LinearColor.White
     mesh.position = Vec3.zeroVector
     mesh.scale = Vec3.zeroVector
-    mesh:draw()
-    Particles.stats.draws += 1
-    local entry = { mesh = mesh, shape = shape, color = LinearColor.White, texture = false }
+    local entry = {
+        mesh = mesh, shape = shape,
+        color = LinearColor.White, texture = false,
+        parked = true,
+    }
     table.insert(entries, entry)
     return entry
 end
 
--- Hide a mesh: there is no visibility flag, so scale it to nothing.
+function Particles.meshSpawnFailed()
+    return meshSpawnFailed
+end
+
+-- Hide a mesh: there is no visibility flag, so scale it to nothing. Flagged so the next
+-- spawn knows it must redraw with a real transform rather than trusting the cached material.
 local function park(entry)
     entry.mesh.scale = Vec3.zeroVector
+    entry.parked = true
 end
 
 local function release(p)
@@ -231,38 +245,40 @@ function Particles.spawn(p)
     local entry = acquire(shape)
     if not entry then return nil end
 
-    local needDraw = false
     local tex = p.texture
     if tex ~= nil then
         if entry.texture ~= tex then
             entry.mesh.texture = tex
             entry.texture = tex
-            needDraw = true
         end
     else
         if entry.texture ~= false then
             entry.mesh.texture = nil
             entry.texture = false
-            needDraw = true
         end
         local col = p.color or LinearColor.White
         if not Util.colorEquals(entry.color, col) then
             entry.mesh.color = col
             entry.color = col
-            needDraw = true
         end
     end
-    if needDraw then
-        entry.mesh:draw()
-        Particles.stats.draws += 1
-    end
+
+    -- Set the transform BEFORE drawing. A mesh first drawn at zero scale seems to stay
+    -- invisible, so a parked entry always gets a fresh draw once it is positioned.
+    local size = (p.size or Vec3.oneVector) * Particles.sizeScale
+    entry.mesh.position = p.position
+    entry.mesh.rotation = p.rotation or camera.rotation
+    entry.mesh.scale = size * (p.growFrom or 1)
+    entry.mesh:draw()
+    entry.parked = false
+    Particles.stats.draws += 1
 
     local particle = {
         entry = entry,
         shape = shape,
         position = p.position,
         velocity = p.velocity or Vec3.zeroVector,
-        size = p.size or Vec3.oneVector,
+        size = size,
         life = math.max(p.life or 1, 0.05),
         age = 0,
         gravity = p.gravity or 0,
@@ -285,10 +301,24 @@ end
 -- A point light that decays. Real light on the arena walls sells an explosion more
 -- than any number of quads.
 function Particles.flash(position, color, intensity, radius, life)
+    -- Hard cap. A stuck light is very visible (it lights the whole goal) and there is no way
+    -- to enumerate lights we have lost track of, so never let the list grow unbounded.
+    while #lights >= Particles.maxLights do
+        lights[1].light:destroy()
+        table.remove(lights, 1)
+    end
     local light = WorldDraw.spawnPointLight(position, intensity, Vec3.new(color.R, color.G, color.B), radius)
     if not light then return nil end
     table.insert(lights, { light = light, age = 0, life = life, intensity = intensity })
     return light
+end
+
+-- Belt and braces for the "goal stayed lit" case: drop every light we know about, then ask
+-- the engine to clear any we do not.
+function Particles.clearLights()
+    for _, l in lights do l.light:destroy() end
+    lights = {}
+    WorldDraw.clearLights()
 end
 
 --------------------------------------------------------------------------------
@@ -371,13 +401,13 @@ function Particles.update(dt)
 
     Particles.stats.live = #live
     Particles.stats.meshes = #entries
+    Particles.stats.lights = #lights
 end
 
 function Particles.clear()
     for _, p in live do release(p) end
     live = {}
-    for _, l in lights do l.light:destroy() end
-    lights = {}
+    Particles.clearLights()
 end
 
 function Particles.destroyAll()
@@ -388,7 +418,33 @@ function Particles.destroyAll()
     liveByShape = {}
     sprites = {}
     meshSpawnFailed = false
-    Particles.stats = { live = 0, meshes = 0, draws = 0, dropped = 0 }
+    Particles.stats = { live = 0, meshes = 0, draws = 0, dropped = 0, lights = 0 }
+end
+
+-- Spawn one of every shape a short distance in front of the camera, at a size that cannot be
+-- missed. If this shows nothing, the problem is mesh rendering itself, not the effects.
+function Particles.testBurst()
+    local rot = camera.rotation
+    local base = camera.position + rot:getForwardVector() * 500
+    local right = rot:getRightVector()
+    local shapes = { "quad", "shard", "ring", "disc" }
+    local spawned = 0
+    for i, shape in shapes do
+        local offset = right * ((i - 2.5) * 160)
+        local p = Particles.spawn({
+            shape = shape,
+            position = base + offset,
+            color = LinearColor.new(i == 1 and 1 or 0, i == 2 and 1 or 0.4, i == 3 and 1 or 0.2, 1),
+            size = Vec3.new(60, 60, 60),
+            life = 6,
+            facing = shape == "quad" and "billboard" or "fixed",
+            rotation = rot,
+        })
+        if p then spawned += 1 end
+    end
+    print(("casterfx test burst: %d/%d spawned, %d meshes pooled, spawnMesh failed=%s")
+        :format(spawned, #shapes, #entries, tostring(meshSpawnFailed)))
+    return spawned, #shapes
 end
 
 --------------------------------------------------------------------------------

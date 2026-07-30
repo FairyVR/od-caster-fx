@@ -27,7 +27,12 @@ function Util.whiten(c, t)
 end
 
 function Util.lerp(a, b, t) return a + (b - a) * t end
+
+-- Exponential damping. Frame-rate independent, unlike a raw lerp by a fixed alpha.
 function Util.damp(cur, tgt, speed, dt) return cur + (tgt - cur) * (1 - math.exp(-speed * dt)) end
+function Util.dampVec3(cur, tgt, speed, dt)
+    return Vec3.lerp(cur, tgt, 1 - math.exp(-speed * dt))
+end
 function Util.easeOutCubic(t) t = math.clamp(t, 0, 1); return 1 - (1 - t) ^ 3 end
 function Util.smoothstep(t) t = math.clamp(t, 0, 1); return t * t * (3 - 2 * t) end
 

@@ -155,9 +155,11 @@ function Effects.goalExplosion(position, rotation, color)
     end
 
     if s.goalLights then
+        -- Base values reduced after the first in-game run, where the flash was the only thing
+        -- clearly visible and read as "it just lit up the goal".
         local lit = s.intensity * s.lightIntensity
-        Particles.flash(position, LinearColor.White, 90000 * lit, 4000, 0.35)
-        Particles.flash(position, bright, 140000 * lit, 6000, 0.9)
+        Particles.flash(position, LinearColor.White, 30000 * lit, 3000, 0.35)
+        Particles.flash(position, bright, 50000 * lit, 5000, 0.9)
     end
 end
 

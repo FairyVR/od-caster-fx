@@ -52,7 +52,8 @@ function Sync-Once {
     $copied = 0
     foreach ($src in Get-ChildItem $PackagePath -Recurse -File) {
         $rel = $src.FullName.Substring($PackagePath.Length + 1)
-        if ($rel -eq 'wanted.json') { continue }   # owned by the game side
+        # Written by the camera in the game folder; syncing over them would clobber live data.
+        if ($rel -eq 'wanted.json' -or $rel -eq 'diagnostics.json') { continue }
         if ($allowedExtensions -notcontains $src.Extension.ToLowerInvariant()) { continue }
         if ($rel -split '[\\/]' | Where-Object { $_.StartsWith('.') }) { continue }
         $target = Join-Path $dest $rel
