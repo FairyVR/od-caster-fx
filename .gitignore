@@ -1,0 +1,15 @@
+# Downloaded team crests -- other people's trademarks, and re-fetchable with get-logos.ps1
+fairy.casterfx/logos/
+
+# Written by the camera script, consumed by get-logos.ps1 -Watch
+fairy.casterfx/wanted.json
+
+# ODC team index cache
+.odc-teams-cache.json
+
+# Tooling state
+.claude-flow/
+
+# Empty files a stray shell redirect left behind
+/0
+/900

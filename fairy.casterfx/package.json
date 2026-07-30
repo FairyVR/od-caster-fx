@@ -1,0 +1,16 @@
+{
+  "author": "Fairy-",
+  "displayName": "Fairy Caster FX",
+  "name": "fairy.casterfx",
+  "version": "1.0.0",
+  "description": "Static team logo overlays on the arena scoreboard plus over-the-top mesh particle VFX. Renders over whichever camera is active.",
+  "keywords": [
+    "casting",
+    "logos",
+    "vfx",
+    "particles",
+    "overlay"
+  ],
+  "defaultKeybind": "",
+  "main": "main.luau"
+}
