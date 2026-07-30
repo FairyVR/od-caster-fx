@@ -521,9 +521,25 @@ local function vfxTab()
     v.impactThreshold = Gui.sliderFloat("Impact threshold (cm/s)", v.impactThreshold, 200, 3000)
 
     Gui.separator()
-    if Gui.button(Icon.Bomb .. " Test goal explosion") and selected then
-        Effects.goalExplosion(selected.away.goalPosition, selected.away.goalRotation,
-            selected.home.color)
+    -- Live count, right next to the buttons: if this stays at 0 after pressing one, the
+    -- effect never spawned. If it jumps but nothing is visible, it is a drawing problem.
+    Gui.text("Particles live: " .. Particles.count()
+        .. "   spawned since load: " .. Particles.stats.spawned)
+    if selected == nil then
+        Gui.textColored(LinearColor.new(1, 0.6, 0.3, 1),
+            "No arena selected -- the goal and kickoff tests do nothing.")
+    end
+
+    if Gui.button(Icon.Bomb .. " Test goal explosion") then
+        if selected then
+            local before = Particles.count()
+            Effects.goalExplosion(selected.away.goalPosition, selected.away.goalRotation,
+                selected.home.color)
+            print(("casterfx test goal: %d -> %d particles at %s"):format(
+                before, Particles.count(), tostring(selected.away.goalPosition)))
+        else
+            issue("casterfx test goal: no arena selected")
+        end
     end
     Gui.sameLine()
     if Gui.button(Icon.Rocket .. " Test kickoff") and selected then

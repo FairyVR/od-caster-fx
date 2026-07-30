@@ -52,26 +52,31 @@ Particles.variants = {
         gravity = 0, drag = 0.985, growth = 2600,
         thickness = 26, resolution = 40, collision = false,
     },
+    -- streak: seconds of travel drawn as the line. minLength: floor in cm, so a slow or
+    -- nearly stopped particle is still a visible dash rather than a point.
     goalEmber = {
         appearance = "ember",
         colourStart = Vec3.new(24, 10, 2),
         colourEnd = Vec3.new(3, 0.4, 0.1),
         gravity = 420, drag = 0.965, growth = 0,
-        thickness = 14, collision = true, restitution = 0.55,
+        thickness = 18, collision = true, restitution = 0.55,
+        streak = 0.09, minLength = 90,
     },
     goalSpark = {
         appearance = "spark",
         colourStart = Vec3.new(40, 40, 26),
         colourEnd = Vec3.new(8, 3, 0.5),
         gravity = 200, drag = 0.94, growth = 0,
-        thickness = 7, collision = false, length = 0.06,
+        thickness = 10, collision = false,
+        streak = 0.07, minLength = 120,
     },
     kickoffEmber = {
         appearance = "ember",
         colourStart = Vec3.new(18, 18, 18),
         colourEnd = Vec3.new(2, 2, 4),
         gravity = 500, drag = 0.97, growth = 0,
-        thickness = 11, collision = true, restitution = 0.4,
+        thickness = 14, collision = true, restitution = 0.4,
+        streak = 0.09, minLength = 90,
     },
     kickoffRing = {
         appearance = "ring",
@@ -86,6 +91,7 @@ Particles.variants = {
         colourEnd = Vec3.new(1.5, 1.5, 1.5),
         gravity = 0, drag = 0.9, growth = 0,
         thickness = 9, collision = false,
+        streak = 0.05, minLength = 40,
     },
     impactRing = {
         appearance = "ring",
@@ -232,6 +238,12 @@ function Particles.isHolding()
     return holdTimer > 0
 end
 
+-- stats.live is only refreshed inside update(), so it reads stale immediately after a
+-- spawn. This is the true count right now.
+function Particles.count()
+    return #particles
+end
+
 -- A controlled experiment for "nothing appears". Each line varies exactly one thing, so the
 -- answer identifies the cause rather than hinting at it. Drawn with a long lifetime and with
 -- our own clearing suspended for the duration.
@@ -308,16 +320,21 @@ function Particles.update(dt)
                 p.position = p.position + p.velocity * step
             end
 
-            -- Colour ramp start -> end, and thickness ramp to zero.
+            -- Colour ramp start -> end. Thickness tapers but never to nothing: a particle
+            -- that thins to zero disappears well before its lifetime is up.
             local colour = Vec3.lerp(p.colourStart, p.colourEnd, elapsed)
-            local thickness = p.thickness * remaining + 0.1
+            local thickness = p.thickness * (0.35 + 0.65 * remaining)
 
-            if preset.appearance == "ember" then
-                WorldDraw.drawLine(p.position, p.position + p.velocity * (1 / 60),
-                    colour.x, colour.y, colour.z, thickness, 0)
-            elseif preset.appearance == "spark" then
+            if preset.appearance == "ember" or preset.appearance == "spark" then
+                -- Streak length is proportional to speed, with a floor. The first version
+                -- used velocity/60, which is a 6cm line for a 400cm/s ember -- invisible
+                -- from the touchline, however bright it was.
                 local dir = p.velocity:getSafeNormal()
-                WorldDraw.drawLine(p.position, p.position + dir * (p.velocity:length() * (preset.length or 0.05)),
+                if dir:length() < 0.001 then dir = Vec3.upVector end
+                local length = math.max(
+                    p.velocity:length() * (preset.streak or 0.06),
+                    (preset.minLength or 70) * Particles.sizeScale)
+                WorldDraw.drawLine(p.position, p.position + dir * length,
                     colour.x, colour.y, colour.z, thickness, 0)
             elseif preset.appearance == "ring" then
                 -- Ease out, so the shockwave leaves fast and settles.
