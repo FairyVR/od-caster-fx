@@ -12,8 +12,8 @@
 --   * Speed adjusts live with the scroll wheel, because the right speed for crossing an
 --     arena is not the right speed for nudging up to a scoreboard.
 --
--- Controls: WASD move, R/F up-down, mouse look, Shift fast, Ctrl slow, scroll speed,
--- Space snap to the arena, Q/E roll reset.
+-- Controls: WASD move, R/E/Space/PageUp up, F/Q/C/PageDown down, mouse look, Shift fast,
+-- Ctrl slow, scroll speed, Home snap to the arena.
 
 local Freecam = {}
 
@@ -88,20 +88,35 @@ function Freecam.update(dt, match)
     if Input.getKey(Input.Key.MouseScrollDown) then Freecam.speed /= 1.08 end
     Freecam.speed = math.clamp(Freecam.speed, 50, 40000)
 
-    if Input.getKeyDown(Input.Key.SpaceBar) then Freecam.snapTo(match) end
+    -- Snap moved off Space, which is now an up-movement alternative. Home, or the GUI button.
+    if Input.getKeyDown(Input.Key.Home) then Freecam.snapTo(match) end
 
     local rotation = Quat.fromEuler(0, pitch, yaw)
     local forward = rotation:getForwardVector()
     local right = rotation:getRightVector()
     local worldUp = gravity.strength > 0 and gravity.upDirection or Vec3.upVector
 
+    -- R/F did not work in game even though the code was right, so up/down accept several
+    -- alternatives rather than betting on one key the client might be swallowing.
+    -- Freecam.keys below reports what is actually being detected.
+    local anyOf = function(...)
+        for _, key in { ... } do
+            if Input.getKey(key) then return true end
+        end
+        return false
+    end
+
     local move = Vec3.zeroVector
-    if Input.getKey(Input.Key.W) then move = move + forward end
-    if Input.getKey(Input.Key.S) then move = move - forward end
-    if Input.getKey(Input.Key.D) then move = move + right end
-    if Input.getKey(Input.Key.A) then move = move - right end
-    if Input.getKey(Input.Key.R) then move = move + worldUp end
-    if Input.getKey(Input.Key.F) then move = move - worldUp end
+    if anyOf(Input.Key.W) then move = move + forward end
+    if anyOf(Input.Key.S) then move = move - forward end
+    if anyOf(Input.Key.D) then move = move + right end
+    if anyOf(Input.Key.A) then move = move - right end
+    if anyOf(Input.Key.R, Input.Key.E, Input.Key.SpaceBar, Input.Key.PageUp) then
+        move = move + worldUp
+    end
+    if anyOf(Input.Key.F, Input.Key.Q, Input.Key.C, Input.Key.PageDown) then
+        move = move - worldUp
+    end
 
     local speed = Freecam.speed
     if Input.getKey(Input.Key.LeftShift) then speed = speed * 4 end
@@ -140,6 +155,29 @@ end
 
 function Freecam.getPosition()
     return position
+end
+
+-- Live state of every key this camera cares about, so a key the client swallows can be
+-- identified by looking at the GUI instead of guessing. Names match Input.Key.
+local PROBE_KEYS = {
+    { "W", Input.Key.W }, { "A", Input.Key.A }, { "S", Input.Key.S }, { "D", Input.Key.D },
+    { "R", Input.Key.R }, { "F", Input.Key.F }, { "E", Input.Key.E }, { "Q", Input.Key.Q },
+    { "C", Input.Key.C }, { "Space", Input.Key.SpaceBar },
+    { "PgUp", Input.Key.PageUp }, { "PgDn", Input.Key.PageDown },
+    { "Shift", Input.Key.LeftShift }, { "Ctrl", Input.Key.LeftControl },
+    { "RMB", Input.Key.RightMouseButton }, { "Home", Input.Key.Home },
+}
+
+function Freecam.keyReport()
+    local down, up = {}, {}
+    for _, entry in PROBE_KEYS do
+        if Input.getKey(entry[2]) then
+            table.insert(down, entry[1])
+        else
+            table.insert(up, entry[1])
+        end
+    end
+    return down, up
 end
 
 return Freecam

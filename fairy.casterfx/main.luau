@@ -46,6 +46,10 @@ local lastImpactTime = -99
 local totalTime = 0
 local selfTestResult = ""
 local newProfileName = ""
+-- Counted so "the effect never fired" can be told apart from "it fired and drew nothing".
+local goalEventCount = 0
+local lastGoalAt = -99
+local lastGoalPosition = nil
 
 -- Error handling. A raw error inside tick() kills the script for the rest of the session,
 -- which is how a goal flash can end up stuck on: the lights stop being decayed. Each phase
@@ -229,6 +233,12 @@ function tick(dt)
     guard("events", function()
         for _, event in selected.events do
             if event.kind == "goal" then
+                goalEventCount += 1
+                lastGoalAt = totalTime
+                lastGoalPosition = event.position
+                print(("casterfx: goal #%d by %s at %s"):format(
+                    goalEventCount, event.team.name ~= "" and event.team.name or "?",
+                    tostring(event.position)))
                 Effects.goalExplosion(event.position, event.rotation, event.team.color)
             elseif event.kind == "kickoff" then
                 Effects.kickoffBurst(event.position, selected.home.color, selected.away.color)
@@ -304,6 +314,11 @@ local function cameraTab()
             config.freecamRequireRightMouse)
         Gui.text(string.format("yaw %.0f  pitch %.0f  speed %.0f",
             Freecam.debug.yaw, Freecam.debug.pitch, Freecam.debug.speed))
+        -- R/F did not work in game despite correct code, so show what the client actually
+        -- reports. Hold a key and read this line: if it never appears, that key is swallowed.
+        local down = Freecam.keyReport()
+        Gui.text("Keys down: " .. (#down > 0 and table.concat(down, " ") or "(none)"))
+        Gui.text("Up: R / E / Space / PageUp    Down: F / Q / C / PageDown")
         if Gui.button(Icon.Crosshairs .. " Snap freecam to arena") then Freecam.snapTo(selected) end
     end
 
@@ -586,6 +601,22 @@ local function debugTab()
         if Gui.button(Icon.Times .. " Clear error") then lastError = ""; errorCount = 0 end
         Gui.separator()
     end
+
+    Gui.separatorText("Is anything drawing at all?")
+    Gui.text("Draws 4 test lines 4m ahead and pauses clearing, so each variable is isolated:")
+    Gui.text("1 dim red  2 HDR red  3 thick white  4 HDR+thick  5 at the goal")
+    Gui.text("None visible = something else is clearing our lines, or lines never draw.")
+    Gui.text("1 but not 2 = HDR values are rejected. 4 but not 5 = the goal position is wrong.")
+    if Gui.button(Icon.Ruler .. " Run line probe (10s)") then
+        Particles.lineProbe(10, lastGoalPosition or (selected and selected.away.goalPosition))
+    end
+    if Particles.isHolding() then
+        Gui.textColored(LinearColor.new(0.5, 0.9, 1, 1), "Probe running -- clearing paused.")
+    end
+
+    Gui.text("Goal events fired: " .. goalEventCount
+        .. (goalEventCount > 0 and ("   last " .. string.format("%.0f", totalTime - lastGoalAt) .. "s ago") or ""))
+    if lastGoalPosition then Gui.text("Last goal at: " .. tostring(lastGoalPosition)) end
 
     Gui.separatorText("In-game diagnostics")
     Gui.text("Writes diagnostics.json into the package folder, with live arena, ball,")

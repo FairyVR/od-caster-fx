@@ -217,14 +217,60 @@ Particles.drawTrail = drawTrail
 -- Update
 --------------------------------------------------------------------------------
 
+local holdTimer = 0
+
 -- Must be called at the START of the tick, before anything draws. Clearing inside update()
 -- would wipe whatever was drawn earlier in the same frame -- the ball trail, for one.
 function Particles.beginFrame()
+    -- While holding, skip our clear so long-lifetime probe lines can survive. If they STILL
+    -- vanish, something else is clearing, or lines are not rendering at all.
+    if holdTimer > 0 then return end
     if Particles.clearEachFrame then WorldDraw.clear() end
+end
+
+function Particles.isHolding()
+    return holdTimer > 0
+end
+
+-- A controlled experiment for "nothing appears". Each line varies exactly one thing, so the
+-- answer identifies the cause rather than hinting at it. Drawn with a long lifetime and with
+-- our own clearing suspended for the duration.
+function Particles.lineProbe(seconds, farPosition)
+    seconds = seconds or 10
+    holdTimer = seconds
+    WorldDraw.clear()
+
+    local rot = camera.rotation
+    local base = camera.position + rot:getForwardVector() * 400
+    local right = rot:getRightVector()
+    local up = rot:getUpVector()
+
+    local function probe(offset, r, g, b, thickness)
+        local from = base + right * offset - up * 100
+        WorldDraw.drawLine(from, from + up * 200, r, g, b, thickness, seconds)
+    end
+
+    -- 1: ordinary colour, ordinary thickness -- does drawLine work here at all?
+    probe(-300, 1, 0, 0, 6)
+    -- 2: HDR colour -- are values above 1 accepted, or clamped/rejected?
+    probe(-100, 20, 0, 0, 6)
+    -- 3: very thick, white -- is thickness the reason things are invisible at distance?
+    probe(100, 1, 1, 1, 40)
+    -- 4: HDR and thick -- what the real effects actually use.
+    probe(300, 30, 30, 30, 20)
+
+    -- 5: at the goal, to test whether distance or position is the problem rather than colour.
+    if farPosition then
+        WorldDraw.drawLine(farPosition, farPosition + Vec3.new(0, 0, 800), 30, 30, 0, 30, seconds)
+    end
+
+    print(("casterfx line probe: 4 lines 4m ahead%s, clearing paused %ds")
+        :format(farPosition and " + 1 at the goal" or "", seconds))
 end
 
 function Particles.update(dt)
     local step = dt * Particles.simSpeed
+    if holdTimer > 0 then holdTimer = math.max(0, holdTimer - dt) end
     if step <= 0 then return end
 
     local up = gravity.strength > 0 and gravity.upDirection or Vec3.upVector
