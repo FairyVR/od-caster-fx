@@ -28,11 +28,13 @@ Util.initializeConfig({
     writeWanted = true,
     autoSelectArena = true,
     autoBindProfile = true,
-    -- Defaults taken from UVC's freecam; the first attempt at these was unusable.
+    -- Defaults from AA's shipped aa.freecam, which the debug freecam is now a port of.
     freecamSpeed = 1600,
     freecamSensitivity = 3.6,
-    freecamSmoothing = 0.55,
-    freecamRequireRightMouse = false,
+    freecamSmoothing = 0,
+    freecamAlignToGravity = true,
+    freecamLocalAxes = true,
+    freecamSpeedAdjustmentRate = 1,
 })
 
 local matches = {}
@@ -99,10 +101,13 @@ local function pushSettings()
     s.trailInterval = v.trailInterval
     s.impactEnabled = v.impactEnabled
 
-    Freecam.speed = config.freecamSpeed
-    Freecam.lookSensitivity = config.freecamSensitivity
-    Freecam.lookSmoothing = config.freecamSmoothing
-    Freecam.requireRightMouse = config.freecamRequireRightMouse
+    -- moveSpeed is not pushed every frame: the camera ramps it live with Shift/Ctrl, and
+    -- overwriting it here would fight that. It syncs back to config on save instead.
+    Freecam.mouseSensitivity = config.freecamSensitivity
+    Freecam.lookSmoothness = config.freecamSmoothing
+    Freecam.alignToGravity = config.freecamAlignToGravity
+    Freecam.localMovementAxes = config.freecamLocalAxes
+    Freecam.speedAdjustmentRate = config.freecamSpeedAdjustmentRate
 end
 
 local function selectIndex(i)
@@ -181,6 +186,7 @@ function main()
     alwaysTick = true
     math.randomseed(math.floor(os.clock() * 1000) % 2147483647)
     Profiles.ensure()
+    Freecam.moveSpeed = config.freecamSpeed
     pushSettings()
     Scoreboard.rescan()
     refreshMatches(true)
@@ -305,21 +311,34 @@ local function cameraTab()
     cam.enabled = Gui.checkbox("Enable sideline camera", cam.enabled)
     Freecam.enabled = Gui.checkbox("Debug freecam (for placing logos)", Freecam.enabled)
     if Freecam.enabled then
-        Gui.text("WASD move, R/F up-down, mouse look, Shift fast, Ctrl slow, scroll speed")
-        config.freecamSpeed = Gui.sliderFloat("Speed (cm/s)", config.freecamSpeed, 100, 20000)
-        config.freecamSensitivity = Gui.sliderFloat("Look sensitivity",
-            config.freecamSensitivity, 0.2, 12)
-        config.freecamSmoothing = Gui.sliderFloat("Look smoothing", config.freecamSmoothing, 0, 0.95)
-        config.freecamRequireRightMouse = Gui.checkbox("Only look while right mouse held",
-            config.freecamRequireRightMouse)
-        Gui.text(string.format("yaw %.0f  pitch %.0f  speed %.0f",
-            Freecam.debug.yaw, Freecam.debug.pitch, Freecam.debug.speed))
-        -- R/F did not work in game despite correct code, so show what the client actually
-        -- reports. Hold a key and read this line: if it never appears, that key is swallowed.
+        -- Same bindings as AA's freecam, on purpose: muscle memory should transfer.
+        Gui.text("WASD move, E up, Q down, Alt swaps local/gravity axes")
+        Gui.text("Mouse look, RIGHT MOUSE + drag to roll, arrows pitch/yaw")
+        Gui.text("Shift faster, Ctrl slower, scroll zoom, Space re-level, Home snap to arena")
+
+        Freecam.moveSpeed = Gui.sliderFloat("Move speed", Freecam.moveSpeed,
+            Freecam.minMoveSpeed, Freecam.maxMoveSpeed)
+        config.freecamSensitivity = Gui.sliderFloat("Mouse sensitivity",
+            config.freecamSensitivity, 0, 10)
+        config.freecamSmoothing = Gui.sliderFloat("Look smoothness", config.freecamSmoothing, 0, 1)
+        config.freecamSpeedAdjustmentRate = Gui.sliderFloat("Speed adjustment rate",
+            config.freecamSpeedAdjustmentRate, 0, 5)
+        config.freecamAlignToGravity = Gui.checkbox("Automatically align to gravity",
+            config.freecamAlignToGravity)
+        config.freecamLocalAxes = Gui.checkbox("Use local movement axes (hold Alt for the other set)",
+            config.freecamLocalAxes)
+
+        Gui.text(string.format("roll %.0f  pitch %.0f  yaw %.0f  speed %.0f",
+            Freecam.debug.roll, Freecam.debug.pitch, Freecam.debug.yaw, Freecam.debug.speed))
         local down = Freecam.keyReport()
         Gui.text("Keys down: " .. (#down > 0 and table.concat(down, " ") or "(none)"))
-        Gui.text("Up: R / E / Space / PageUp    Down: F / Q / C / PageDown")
+
         if Gui.button(Icon.Crosshairs .. " Snap freecam to arena") then Freecam.snapTo(selected) end
+        Gui.sameLine()
+        if Gui.button(Icon.Save .. " Save freecam speed") then
+            config.freecamSpeed = Freecam.moveSpeed
+            if saveConfig() then print("casterfx: freecam settings saved") end
+        end
     end
 
     Gui.text(string.format("Side %+d (blend %+.2f)   FOV %.0f   subject %.0f cm   lift %.0f",
