@@ -1,7 +1,10 @@
--- Effects: the actual VFX, composed out of the particle engine.
+-- Effects: the VFX, composed from the HDR line particle engine.
 --
--- Deliberately over the top. Every count is multiplied by settings.intensity, so
--- turning it down is one slider rather than an edit.
+-- Deliberately over the top. Every count scales with settings.intensity, so turning it down
+-- is one slider rather than an edit.
+--
+-- Team colours are multiplied well past 1 before being handed to the engine, because that is
+-- what makes them bloom. A team colour used raw (0-1) reads as a dull coloured stick.
 
 local Util = require("util")
 local Particles = require("particles")
@@ -16,18 +19,15 @@ Effects.settings = {
     goalSparks = true,
     goalSprites = true,
     goalLights = true,
+    lightIntensity = 0.35,
     kickoffEnabled = true,
     trailEnabled = true,
-    trailInterval = 0.03,
+    trailInterval = 0.02,
+    trailLength = 26,
+    trailBoost = 12,
     impactEnabled = true,
-    -- Point light intensity is in engine units with no documented scale, so this is a
-    -- calibration knob rather than a constant. Turn it down if goals blow out the exposure.
-    lightIntensity = 1.0,
+    hdrBoost = 20,     -- how far past 1 team colours are pushed
 }
-
-local SPRITE_FLARE = "sprites/flare.png"
-local SPRITE_STAR  = "sprites/star.png"
-local SPRITE_SPARK = "sprites/spark.png"
 
 local function count(n)
     return math.max(1, math.floor(n * Effects.settings.intensity))
@@ -37,129 +37,100 @@ local function up()
     return gravity.strength > 0 and gravity.upDirection or Vec3.upVector
 end
 
--- Rotation that puts a ring/disc (whose geometry lies in the YZ plane, normal +X)
--- flat against the plane whose normal is `normal`.
-local function facePlane(normal)
-    local n = normal:getSafeNormal()
-    if n:length() < 0.001 then return Quat.identity end
-    return Quat.fromXZ(n, Util.perpendicular(n))
+-- LinearColor (0-1) -> HDR Vec3 for the engine. Normalised first so a dark team colour still
+-- glows: without this, a navy team would emit almost nothing.
+local function hdr(colour, boost)
+    local peak = math.max(colour.R, colour.G, colour.B, 0.15)
+    local scale = (boost or Effects.settings.hdrBoost) / peak
+    return Vec3.new(colour.R * scale, colour.G * scale, colour.B * scale)
+end
+
+local function whiteHot(boost)
+    local b = boost or 40
+    return Vec3.new(b, b, b)
 end
 
 --------------------------------------------------------------------------------
 -- Goal
 --------------------------------------------------------------------------------
 
-function Effects.goalExplosion(position, rotation, color)
+function Effects.goalExplosion(position, rotation, colour)
     local s = Effects.settings
     if not s.goalEnabled then return end
 
-    local hot = Util.whiten(color, 0.55)
-    local bright = Util.boost(color, 1.6)
+    local teamHdr = hdr(colour)
     local u = up()
-
-    -- Core flash: a disc that blows up fast and vanishes. Reads as the initial pop.
-    Particles.spawn({
-        shape = "disc", position = position, color = LinearColor.White,
-        size = Vec3.new(1, 90, 90), life = 0.3,
-        growFrom = 0.15, growTo = 7, facing = "billboard",
-    })
+    -- Rings sit in the plane of the goal mouth; forward is the goal's own facing.
+    local goalForward = rotation:getForwardVector()
 
     if s.goalShockwaves then
-        -- Rings in the plane of the goal mouth, staggered so they read as a pulse train.
+        -- Three staggered rings read as a pulse train rather than one pop.
         for i = 1, 3 do
             Particles.spawn({
-                shape = "ring", position = position, color = i == 1 and hot or bright,
-                size = Vec3.new(1, 120, 120), life = 0.7 + i * 0.35,
-                growFrom = 0.08, growTo = 14 + i * 6,
-                facing = "fixed", rotation = rotation,
+                variant = "goalRing",
+                position = position,
+                forward = goalForward,
+                life = 0.55 + i * 0.3,
+                radius = 40,
+                colourStart = i == 1 and whiteHot(50) or teamHdr,
+                colourEnd = Vec3.new(teamHdr.x * 0.1, teamHdr.y * 0.1, teamHdr.z * 0.1),
             })
         end
-        -- One flat on the floor, which is what sells scale on a wide autocam shot.
+        -- One flat on the floor, which is what sells scale on a wide shot.
         Particles.spawn({
-            shape = "ring", position = position - u * 60, color = bright,
-            size = Vec3.new(1, 150, 150), life = 1.5,
-            growFrom = 0.05, growTo = 22,
-            facing = "fixed", rotation = facePlane(u),
+            variant = "goalRing",
+            position = position - u * 40,
+            forward = u,
+            life = 1.4, radius = 60,
+            colourStart = teamHdr,
         })
     end
 
     if s.goalDebris then
-        for _ = 1, count(140) do
+        for _ = 1, count(90) do
             local dir = Util.randomUnit()
-            local speed = Util.randomRange(300, 1500)
             Particles.spawn({
-                shape = "shard", position = position + dir * Util.randomRange(10, 90),
-                velocity = dir * speed + u * Util.randomRange(100, 500),
-                color = math.random() < 0.25 and hot or color,
-                size = Vec3.new(Util.randomRange(25, 70), Util.randomRange(5, 12), Util.randomRange(5, 12)),
-                life = Util.randomRange(1.6, 3.2),
-                gravity = 900, drag = 0.35, bounce = true, restitution = 0.45,
-                facing = "spin",
-                rotation = Quat.fromEuler(math.random() * 360, math.random() * 360, math.random() * 360),
-                spin = Vec3.new(Util.randomRange(-400, 400), Util.randomRange(-400, 400), Util.randomRange(-400, 400)),
-                growTo = 0.7,
+                variant = "goalEmber",
+                position = position + dir * Util.randomRange(10, 80),
+                velocity = dir * Util.randomRange(400, 1800) + u * Util.randomRange(100, 600),
+                life = Util.randomRange(1.4, 3.0),
+                colourStart = math.random() < 0.3 and whiteHot(45) or teamHdr,
             })
         end
     end
 
     if s.goalSparks then
-        for _ = 1, count(70) do
-            local dir = Util.randomUnit()
+        for _ = 1, count(60) do
             Particles.spawn({
-                shape = "shard", position = position,
-                velocity = dir * Util.randomRange(1200, 3200),
-                color = hot,
-                size = Vec3.new(Util.randomRange(60, 160), 4, 4),
-                life = Util.randomRange(0.45, 1.1),
-                gravity = 400, drag = 1.4,
-                facing = "velocity", growTo = 0.2,
+                variant = "goalSpark",
+                position = position,
+                velocity = Util.randomUnit() * Util.randomRange(2000, 4500),
+                life = Util.randomRange(0.35, 0.9),
+                colourStart = whiteHot(60),
+                colourEnd = Vec3.new(teamHdr.x * 0.3, teamHdr.y * 0.3, teamHdr.z * 0.3),
             })
         end
     end
 
+    -- A slow, wide cloud that lingers after the fast stuff is gone.
     if s.goalSprites then
-        local flare = Particles.sprite(SPRITE_FLARE)
-        local star = Particles.sprite(SPRITE_STAR)
-        if flare then
-            for _ = 1, count(45) do
-                local dir = Util.randomUnit()
-                local size = Util.randomRange(60, 180)
-                Particles.spawn({
-                    shape = "quad", position = position + dir * Util.randomRange(20, 200),
-                    velocity = dir * Util.randomRange(200, 900) + u * Util.randomRange(50, 300),
-                    texture = flare, size = Vec3.new(1, size, size),
-                    life = Util.randomRange(0.6, 1.5),
-                    gravity = 200, drag = 1.0,
-                    facing = "billboard", roll = math.random() * 360,
-                    rollSpeed = Util.randomRange(-220, 220),
-                    growFrom = 0.4, growTo = 1.3,
-                })
-            end
-        end
-        if star then
-            for _ = 1, count(22) do
-                local dir = Util.randomUnit()
-                local size = Util.randomRange(120, 320)
-                Particles.spawn({
-                    shape = "quad", position = position + dir * Util.randomRange(50, 300),
-                    velocity = dir * Util.randomRange(100, 500),
-                    texture = star, size = Vec3.new(1, size, size),
-                    life = Util.randomRange(0.8, 1.8),
-                    drag = 1.2,
-                    facing = "billboard", roll = math.random() * 360,
-                    rollSpeed = Util.randomRange(-90, 90),
-                    growFrom = 0.2, growTo = 1.6,
-                })
-            end
+        for _ = 1, count(40) do
+            local dir = Util.randomUnit()
+            Particles.spawn({
+                variant = "goalEmber",
+                position = position + dir * Util.randomRange(50, 400),
+                velocity = dir * Util.randomRange(100, 500) + u * Util.randomRange(50, 250),
+                life = Util.randomRange(2.0, 4.0),
+                colourStart = teamHdr,
+                colourEnd = Vec3.new(0.5, 0.5, 0.6),
+            })
         end
     end
 
     if s.goalLights then
-        -- Base values reduced after the first in-game run, where the flash was the only thing
-        -- clearly visible and read as "it just lit up the goal".
         local lit = s.intensity * s.lightIntensity
         Particles.flash(position, LinearColor.White, 30000 * lit, 3000, 0.35)
-        Particles.flash(position, bright, 50000 * lit, 5000, 0.9)
+        Particles.flash(position, colour, 50000 * lit, 5000, 0.9)
     end
 end
 
@@ -172,124 +143,93 @@ function Effects.kickoffBurst(position, homeColor, awayColor)
     if not s.kickoffEnabled then return end
     local u = up()
 
-    for i, col in { homeColor, awayColor } do
+    for i, colour in { homeColor, awayColor } do
         Particles.spawn({
-            shape = "ring", position = position, color = Util.boost(col, 1.4),
-            size = Vec3.new(1, 100, 100), life = 1.1 + i * 0.2,
-            growFrom = 0.05, growTo = 16,
-            facing = "fixed", rotation = facePlane(u),
+            variant = "kickoffRing",
+            position = position,
+            forward = u,
+            life = 0.9 + i * 0.25,
+            radius = 40,
+            colourStart = hdr(colour),
         })
     end
 
-    -- Column of sparks rising out of centre court.
-    for _ = 1, count(60) do
+    -- Column rising out of centre court.
+    for _ = 1, count(50) do
         local dir = Util.randomUnit()
-        -- Project onto the arena floor plane rather than assuming world Z is up,
-        -- so this still works in a zero-g or rotated arena.
+        -- Project onto the floor plane rather than assuming world Z is up, so this still
+        -- works in a zero-g or rotated arena.
         local flat = (dir - u * dir:dot(u)):getSafeNormal()
         Particles.spawn({
-            shape = "shard", position = position + flat * Util.randomRange(0, 160),
-            velocity = u * Util.randomRange(600, 1600) + flat * Util.randomRange(50, 250),
-            color = math.random() < 0.5 and homeColor or awayColor,
-            size = Vec3.new(Util.randomRange(40, 90), 5, 5),
+            variant = "kickoffEmber",
+            position = position + flat * Util.randomRange(0, 150),
+            velocity = u * Util.randomRange(800, 2200) + flat * Util.randomRange(50, 300),
             life = Util.randomRange(0.9, 1.8),
-            gravity = 700, drag = 0.5,
-            facing = "velocity", growTo = 0.3,
+            colourStart = hdr(math.random() < 0.5 and homeColor or awayColor),
         })
-    end
-
-    local spark = Particles.sprite(SPRITE_SPARK)
-    if spark then
-        for _ = 1, count(24) do
-            local dir = Util.randomUnit()
-            local size = Util.randomRange(80, 200)
-            Particles.spawn({
-                shape = "quad", position = position + dir * Util.randomRange(30, 250),
-                velocity = u * Util.randomRange(200, 700),
-                texture = spark, size = Vec3.new(1, size, size),
-                life = Util.randomRange(0.7, 1.4), drag = 1.0,
-                facing = "billboard", roll = math.random() * 360,
-                rollSpeed = Util.randomRange(-160, 160), growTo = 1.4,
-            })
-        end
     end
 end
 
 --------------------------------------------------------------------------------
--- Ball trail
+-- Ball trail -- a connected ribbon
 --------------------------------------------------------------------------------
 
 local trailTimer = 0
 
-function Effects.ballTrail(dt, position, velocity, color)
+function Effects.ballTrail(dt, position, velocity, colour)
     local s = Effects.settings
     if not s.trailEnabled or position == nil then
-        trailTimer = 0
+        Effects.resetTrail()
         return
     end
-    local speed = velocity and velocity:length() or 0
+
     trailTimer += dt
     local interval = math.max(s.trailInterval, 0.008)
     -- Cap the catch-up: after a hitch or the first frame following a load, dt can be large
-    -- enough to ask for hundreds of puffs at once and blow the whole particle budget.
-    local budget = 8
+    -- enough to ask for dozens of points at once.
+    local budget = 6
     while trailTimer >= interval and budget > 0 do
         trailTimer -= interval
         budget -= 1
-        local scaled = math.clamp(speed / 1500, 0, 1)
-        -- Coloured part is untextured: a textured mesh ignores `color`, and the
-        -- trail must be the possessing team's colour.
-        Particles.spawn({
-            shape = "disc", position = position,
-            color = Util.boost(color, 1.3),
-            size = Vec3.new(1, 22 + scaled * 26, 22 + scaled * 26),
-            life = 0.34 + scaled * 0.2,
-            facing = "billboard", growTo = 0.1,
-        })
-        if speed > 900 and math.random() < 0.5 then
-            local spark = Particles.sprite(SPRITE_SPARK)
-            if spark then
-                Particles.spawn({
-                    shape = "quad", position = position,
-                    velocity = velocity * -0.15 + Util.randomUnit() * 120,
-                    texture = spark, size = Vec3.new(1, 40, 40),
-                    life = 0.35, drag = 2.0,
-                    facing = "billboard", roll = math.random() * 360, growTo = 0.2,
-                })
-            end
-        end
+        Particles.pushTrailPoint(position, colour, math.floor(s.trailLength))
     end
     if budget == 0 then trailTimer = 0 end
+
+    -- Redrawn every frame, since lines are cleared every frame.
+    local speed = velocity and velocity:length() or 0
+    local speedBoost = 1 + math.clamp(speed / 2000, 0, 1)
+    Particles.drawTrail(10, s.trailBoost * speedBoost)
+end
+
+function Effects.resetTrail()
+    trailTimer = 0
+    Particles.clearTrail()
 end
 
 --------------------------------------------------------------------------------
 -- Impact
 --------------------------------------------------------------------------------
 
-function Effects.impactRing(position, normal, color)
+function Effects.impactRing(position, normal, colour)
     if not Effects.settings.impactEnabled then return end
     Particles.spawn({
-        shape = "ring", position = position, color = Util.boost(color, 1.5),
-        size = Vec3.new(1, 60, 60), life = 0.45,
-        growFrom = 0.1, growTo = 7,
-        facing = "fixed", rotation = facePlane(normal),
+        variant = "impactRing",
+        position = position,
+        forward = normal,
+        life = 0.4,
+        radius = 25,
+        colourStart = hdr(colour, 26),
     })
-    for _ = 1, count(10) do
-        local dir = (normal + Util.randomUnit() * 0.6):getSafeNormal()
+    for _ = 1, count(8) do
+        local dir = (normal + Util.randomUnit() * 0.7):getSafeNormal()
         Particles.spawn({
-            shape = "shard", position = position,
-            velocity = dir * Util.randomRange(400, 1100),
-            color = Util.whiten(color, 0.4),
-            size = Vec3.new(Util.randomRange(30, 60), 4, 4),
-            life = Util.randomRange(0.3, 0.6),
-            gravity = 600, drag = 1.5,
-            facing = "velocity", growTo = 0.2,
+            variant = "goalSpark",
+            position = position,
+            velocity = dir * Util.randomRange(600, 1600),
+            life = Util.randomRange(0.2, 0.45),
+            colourStart = whiteHot(35),
         })
     end
-end
-
-function Effects.resetTrail()
-    trailTimer = 0
 end
 
 return Effects

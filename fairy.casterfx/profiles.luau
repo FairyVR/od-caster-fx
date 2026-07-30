@@ -54,8 +54,11 @@ Profiles.vfxDefaults = {
     enabled = true,
     intensity = 1.0,
     simSpeed = 1.0,
-    sizeScale = 2.5,
-    maxMeshes = 420,
+    sizeScale = 1.0,
+    maxParticles = 900,
+    -- How far past 1 team colours are pushed before being drawn. Values above 1 bloom, and
+    -- that glow is the entire difference between a satisfying particle and a coloured stick.
+    hdrBoost = 20,
 
     goalEnabled = true,
     goalShockwaves = true,
@@ -67,7 +70,9 @@ Profiles.vfxDefaults = {
 
     kickoffEnabled = true,
     trailEnabled = true,
-    trailInterval = 0.03,
+    trailInterval = 0.02,
+    trailLength = 26,
+    trailBoost = 12,
     impactEnabled = true,
     impactThreshold = 900,
 }

@@ -48,9 +48,10 @@ end
 -- Capability probes -- can the engine do the things this package depends on?
 --------------------------------------------------------------------------------
 
+-- Particles no longer use meshes, but the logo quads still do, so this probe still matters.
 local function probeMesh(r)
     local mesh = WorldDraw.spawnMesh()
-    if not r.check("WorldDraw.spawnMesh returns a mesh", mesh ~= nil, tostring(mesh)) then
+    if not r.check("WorldDraw.spawnMesh returns a mesh (logos need it)", mesh ~= nil, tostring(mesh)) then
         return nil
     end
     -- Minimal visible-size triangle in front of the camera, drawn AFTER the transform is set.
@@ -205,20 +206,27 @@ end
 local function snapshotParticles(r)
     local before = Particles.stats.live
     local spawned = Particles.testBurst()
-    r.check("test burst spawned meshes", spawned > 0,
-        ("%d spawned, pool=%d, spawnMesh failed=%s")
-            :format(spawned, Particles.stats.meshes, tostring(Particles.meshSpawnFailed())))
-    r.check("particle pool is not empty", Particles.stats.meshes > 0,
-        Particles.stats.meshes .. " meshes pooled")
+    r.check("test burst spawned particles", spawned > 0, spawned .. " spawned")
+    r.check("particles are live after the burst", Particles.stats.live > before,
+        ("live %d -> %d"):format(before, Particles.stats.live))
+
+    -- HDR is what makes particles glow rather than look like coloured sticks, so record the
+    -- peak channel actually being emitted.
+    local peak = 0
+    for _, v in pairs(Particles.variants) do
+        peak = math.max(peak, v.colourStart.x, v.colourStart.y, v.colourStart.z)
+    end
+    r.check("variant colours are HDR (>1)", peak > 1, "peak channel " .. peak)
+
     return {
         liveBefore = before,
         liveAfter = Particles.stats.live,
-        meshes = Particles.stats.meshes,
-        draws = Particles.stats.draws,
+        spawnedTotal = Particles.stats.spawned,
         recycled = Particles.stats.dropped,
         lights = Particles.stats.lights,
-        spawnMeshFailed = Particles.meshSpawnFailed(),
         sizeScale = Particles.sizeScale,
+        peakColourChannel = peak,
+        maxParticles = Particles.maxParticles,
     }
 end
 

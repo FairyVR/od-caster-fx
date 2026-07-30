@@ -1,320 +1,178 @@
--- Particles: pooled mesh particle engine.
+-- Particles: HDR line-based particle engine.
 --
--- Why meshes and not drawLine: meshes depth-test properly, and their transforms can be
--- changed WITHOUT calling draw() again, so animating hundreds of them is nearly free.
--- draw() is only paid when geometry, colour, or texture changes -- so pool entries cache
--- their current material and skip the redraw when a new particle wants the same one.
+-- Rewritten after the mesh version looked flat and dull in game. Approach and tuning follow
+-- yasai's laserTag VFX, which is the best-looking particle work in the spectator ecosystem:
 --
--- Two material paths, forced by the API: a mesh with a texture ignores `color` entirely
--- (base.d.lua: "Solid color the mesh renders with when no texture is set"). So team-coloured
--- particles are untextured geometry, and textured sprites are used as-is.
--- Cutout alpha also means no soft fade -- everything fades out by SHRINKING instead.
+--   * Colours are HDR. WorldDraw.drawLine takes 0-1 nominally, but values FAR above 1
+--     (10, 20, 40) blow out into bloom. That glow is what makes a particle read as
+--     energetic rather than as a coloured stick. Untextured meshes cannot do this at all,
+--     which is why the mesh version looked lifeless.
+--   * Embers are drawn from position to position+velocity, so they stretch along their own
+--     motion. A fast particle becomes a streak and a slow one becomes a dot, for free, and
+--     it reads as 3D depth even though a line is flat.
+--   * Colour ramps from colourStart to colourEnd over the lifetime, and thickness ramps to
+--     zero. Nothing pops out of existence.
+--   * Rings are polylines, so they can be huge without costing anything.
+--
+-- Meshes are still used for the logo quads (they need textures) but no longer for particles.
+--
+-- NOTE ON CLEARING: lines are drawn every frame with lifetime 0 and cleared at the start of
+-- our own update. WorldDraw.clear() is global -- it drops other scripts' lines too -- but
+-- every line-drawing camera script does exactly this, and only the active camera's script
+-- runs the clear.
 
 local Util = require("util")
 
 local Particles = {}
 
-Particles.maxMeshes = 420   -- hard ceiling on pooled meshes
-Particles.maxLights = 6     -- point lights are the one effect that was definitely visible
+Particles.maxParticles = 900
+Particles.maxLights = 6
 Particles.simSpeed = 1
-Particles.intensity = 1
-Particles.sizeScale = 2.5   -- everything is viewed from ~26m; unscaled particles are specks
+Particles.sizeScale = 1
 Particles.enabled = true
-Particles.stats = { live = 0, meshes = 0, draws = 0, dropped = 0, lights = 0 }
+Particles.clearEachFrame = true
+Particles.stats = { live = 0, lights = 0, dropped = 0, spawned = 0 }
 
-local live = {}          -- active particles (unordered; swap-removed)
-local freeByShape = {}   -- shape -> { entry }
-local liveByShape = {}   -- shape -> count, for recycle decisions
-local entries = {}       -- every entry ever created, for destroyAll
-local geometry = {}
-local sprites = {}       -- path -> LuauTexture | false (false = tried and failed)
+local particles = {}
 local lights = {}
-local meshSpawnFailed = false
 
 --------------------------------------------------------------------------------
--- Geometry. Everything is double-sided: both windings are emitted, so the
--- "winding is swapped for Unreal" trap can't make a particle invisible.
+-- Variants: the emitter presets. HDR colours on purpose.
 --------------------------------------------------------------------------------
 
--- Push both windings of quad a-b-c-d. Indices are 0-BASED (mesh.triangles is not
--- 1-indexed like the rest of Luau).
-local function pushQuad(t, a, b, c, d)
-    table.insert(t, a); table.insert(t, c); table.insert(t, b)
-    table.insert(t, a); table.insert(t, d); table.insert(t, c)
-    table.insert(t, a); table.insert(t, b); table.insert(t, c)
-    table.insert(t, a); table.insert(t, c); table.insert(t, d)
-end
-
-local function pushTri(t, a, b, c)
-    table.insert(t, a); table.insert(t, c); table.insert(t, b)
-    table.insert(t, a); table.insert(t, b); table.insert(t, c)
-end
-
--- Unit quad in the YZ plane (normal along X) so a camera-facing rotation points it at us.
-local function buildQuad()
-    local v = { Vec3.new(0, -1, -1), Vec3.new(0, 1, -1), Vec3.new(0, 1, 1), Vec3.new(0, -1, 1) }
-    local uv = { Vec2.new(0, 1), Vec2.new(1, 1), Vec2.new(1, 0), Vec2.new(0, 0) }
-    local n = { Vec3.new(-1, 0, 0), Vec3.new(-1, 0, 0), Vec3.new(-1, 0, 0), Vec3.new(-1, 0, 0) }
-    local t = {}
-    pushQuad(t, 0, 1, 2, 3)
-    return { vertices = v, triangles = t, normals = n, uvs = uv }
-end
-
--- Tapered spike along +X. Scale x = length, y/z = width. Used for debris and streaks.
-local function buildShard()
-    local r = 0.35
-    local v = {
-        Vec3.new(1, 0, 0),
-        Vec3.new(0, r, 0),
-        Vec3.new(0, -r * 0.5, r * 0.866),
-        Vec3.new(0, -r * 0.5, -r * 0.866),
-    }
-    local n = { Vec3.new(1, 0, 0), Vec3.new(0, 1, 0), Vec3.new(0, -0.5, 0.866), Vec3.new(0, -0.5, -0.866) }
-    local uv = { Vec2.new(0.5, 0), Vec2.new(0, 1), Vec2.new(1, 1), Vec2.new(0.5, 1) }
-    local t = {}
-    pushTri(t, 0, 1, 2); pushTri(t, 0, 2, 3); pushTri(t, 0, 3, 1); pushTri(t, 1, 3, 2)
-    return { vertices = v, triangles = t, normals = n, uvs = uv }
-end
-
--- Flat annulus of outer radius 1 in the YZ plane. Scale y/z to grow the shockwave.
-local function buildRing(segments, inner)
-    local v, n, uv, t = {}, {}, {}, {}
-    for i = 0, segments - 1 do
-        local a = (i / segments) * 2 * math.pi
-        local c, s = math.cos(a), math.sin(a)
-        table.insert(v, Vec3.new(0, c * inner, s * inner))
-        table.insert(v, Vec3.new(0, c, s))
-        table.insert(n, Vec3.new(-1, 0, 0)); table.insert(n, Vec3.new(-1, 0, 0))
-        local u = i / segments
-        table.insert(uv, Vec2.new(u, 0)); table.insert(uv, Vec2.new(u, 1))
-    end
-    for i = 0, segments - 1 do
-        local j = (i + 1) % segments
-        pushQuad(t, i * 2, i * 2 + 1, j * 2 + 1, j * 2)
-    end
-    return { vertices = v, triangles = t, normals = n, uvs = uv }
-end
-
-geometry.quad  = buildQuad()
-geometry.shard = buildShard()
-geometry.ring  = buildRing(56, 0.88)
-geometry.disc  = buildRing(40, 0.0)
+-- appearance:
+--   "ember"  line from position along velocity -- streaks, sparks, debris
+--   "ring"   expanding polyline circle facing `forward` -- shockwaves
+--   "spark"  short fixed-length line along velocity -- bright fast chips
+Particles.variants = {
+    goalRing = {
+        appearance = "ring",
+        colourStart = Vec3.new(30, 30, 30),
+        colourEnd = Vec3.new(6, 6, 6),
+        gravity = 0, drag = 0.985, growth = 2600,
+        thickness = 26, resolution = 40, collision = false,
+    },
+    goalEmber = {
+        appearance = "ember",
+        colourStart = Vec3.new(24, 10, 2),
+        colourEnd = Vec3.new(3, 0.4, 0.1),
+        gravity = 420, drag = 0.965, growth = 0,
+        thickness = 14, collision = true, restitution = 0.55,
+    },
+    goalSpark = {
+        appearance = "spark",
+        colourStart = Vec3.new(40, 40, 26),
+        colourEnd = Vec3.new(8, 3, 0.5),
+        gravity = 200, drag = 0.94, growth = 0,
+        thickness = 7, collision = false, length = 0.06,
+    },
+    kickoffEmber = {
+        appearance = "ember",
+        colourStart = Vec3.new(18, 18, 18),
+        colourEnd = Vec3.new(2, 2, 4),
+        gravity = 500, drag = 0.97, growth = 0,
+        thickness = 11, collision = true, restitution = 0.4,
+    },
+    kickoffRing = {
+        appearance = "ring",
+        colourStart = Vec3.new(20, 20, 20),
+        colourEnd = Vec3.new(3, 3, 3),
+        gravity = 0, drag = 0.99, growth = 1700,
+        thickness = 18, resolution = 36, collision = false,
+    },
+    trail = {
+        appearance = "ember",
+        colourStart = Vec3.new(14, 14, 14),
+        colourEnd = Vec3.new(1.5, 1.5, 1.5),
+        gravity = 0, drag = 0.9, growth = 0,
+        thickness = 9, collision = false,
+    },
+    impactRing = {
+        appearance = "ring",
+        colourStart = Vec3.new(24, 24, 24),
+        colourEnd = Vec3.new(4, 4, 4),
+        gravity = 0, drag = 0.98, growth = 700,
+        thickness = 12, resolution = 28, collision = false,
+    },
+}
 
 --------------------------------------------------------------------------------
--- Sprites
+-- Drawing helpers
 --------------------------------------------------------------------------------
 
-function Particles.sprite(path)
-    if sprites[path] ~= nil then
-        return sprites[path] or nil
+-- Polyline circle in the plane whose normal is `direction`.
+local function drawCircle(position, radius, direction, colour, thickness, resolution)
+    local normal = direction:getSafeNormal()
+    if normal:length() < 0.001 then normal = Vec3.upVector end
+    local reference = math.abs(normal.z) < 0.9 and Vec3.upVector or Vec3.rightVector
+    local up = Vec3.cross(normal, reference):getSafeNormal()
+    local right = Vec3.cross(normal, up):getSafeNormal()
+
+    local step = math.pi * 2 / resolution
+    local previous = position + right * radius
+    for i = 1, resolution do
+        local theta = i * step
+        local point = position + (up * math.sin(theta) + right * math.cos(theta)) * radius
+        WorldDraw.drawLine(previous, point, colour.x, colour.y, colour.z, thickness, 0)
+        previous = point
     end
-    local ok, tex = pcall(LuauFile.loadTexture, path)
-    if not ok or tex == nil then
-        sprites[path] = false
-        warn("casterfx: could not load sprite " .. path)
-        return nil
-    end
-    sprites[path] = tex
-    return tex
-end
-
-function Particles.clearSpriteCache()
-    sprites = {}
-end
-
---------------------------------------------------------------------------------
--- Pool
---------------------------------------------------------------------------------
-
--- Geometry is assigned here but draw() is deliberately NOT called yet: a mesh drawn while
--- parked at zero scale and origin position appears to never render afterwards, which is the
--- most likely reason the first version produced light flashes and no visible particles at all.
--- Every spawn now draws after the transform is set. See `parked` below.
-local function createEntry(shape)
-    if meshSpawnFailed or #entries >= Particles.maxMeshes then return nil end
-    local mesh = WorldDraw.spawnMesh()
-    if mesh == nil then
-        meshSpawnFailed = true
-        issue("casterfx: WorldDraw.spawnMesh() returned nil; particle pool capped at " .. #entries)
-        return nil
-    end
-    local g = geometry[shape]
-    mesh.vertices = g.vertices
-    mesh.triangles = g.triangles
-    mesh.normals = g.normals
-    mesh.uVs = g.uvs
-    mesh.color = LinearColor.White
-    mesh.position = Vec3.zeroVector
-    mesh.scale = Vec3.zeroVector
-    local entry = {
-        mesh = mesh, shape = shape,
-        color = LinearColor.White, texture = false,
-        parked = true,
-    }
-    table.insert(entries, entry)
-    return entry
-end
-
-function Particles.meshSpawnFailed()
-    return meshSpawnFailed
-end
-
--- Hide a mesh: there is no visibility flag, so scale it to nothing. Flagged so the next
--- spawn knows it must redraw with a real transform rather than trusting the cached material.
-local function park(entry)
-    entry.mesh.scale = Vec3.zeroVector
-    entry.parked = true
-end
-
-local function release(p)
-    park(p.entry)
-    liveByShape[p.shape] = (liveByShape[p.shape] or 1) - 1
-    local fl = freeByShape[p.shape]
-    if not fl then fl = {}; freeByShape[p.shape] = fl end
-    table.insert(fl, p.entry)
-end
-
--- Oldest live particle of this shape, so a burst that exceeds the budget recycles
--- its own tail rather than dropping the new (more visible) particles.
--- ponytail: scans at most SCAN_LIMIT candidates, so this is "old enough" rather than
--- strictly oldest. A full scan per spawn is O(live) and a goal burst spawns hundreds in
--- one frame. Swap in a per-shape age-ordered structure if that ever proves visible.
-local SCAN_LIMIT = 64
-
-local function stealOldest(shape)
-    local bestIdx, bestAge, seen = nil, -1, 0
-    for i, p in live do
-        if p.shape == shape then
-            if p.age > bestAge then bestAge = p.age; bestIdx = i end
-            seen += 1
-            if seen >= SCAN_LIMIT then break end
-        end
-    end
-    if not bestIdx then return nil end
-    local p = live[bestIdx]
-    local entry = p.entry
-    liveByShape[shape] = (liveByShape[shape] or 1) - 1
-    live[bestIdx] = live[#live]
-    table.remove(live)
-    Particles.stats.dropped += 1
-    return entry
-end
-
-local function acquire(shape)
-    local fl = freeByShape[shape]
-    if fl and #fl > 0 then
-        local e = fl[#fl]
-        table.remove(fl)
-        return e
-    end
-    local e = createEntry(shape)
-    if e then return e end
-    return stealOldest(shape)
 end
 
 --------------------------------------------------------------------------------
 -- Spawning
 --------------------------------------------------------------------------------
 
--- p fields (all optional except shape/position):
---   shape        "quad" | "shard" | "ring" | "disc"
---   position     Vec3
---   velocity     Vec3         cm/s
---   color        LinearColor  ignored when texture is set
---   texture      LuauTexture
---   size         Vec3         local half-extents before curves
---   life         seconds
---   gravity      cm/s^2 along -up
---   drag         per-second exponential damping
---   bounce       reflect off geometry via raycast
---   restitution  bounce energy kept (default 0.5)
---   facing       "billboard" | "velocity" | "fixed" | "spin"
---   rotation     Quat, used by "fixed" and as the base for "spin"
---   spin         Vec3 of euler degrees/second, used by "spin"
---   roll         starting roll degrees, used by "billboard"
---   rollSpeed    degrees/second, used by "billboard"
---   growFrom     size multiplier at birth (default 1)
---   growTo       size multiplier at death (default 1)
+-- p: { variant, position, velocity, forward, life, radius, colourStart?, colourEnd?, count? }
 function Particles.spawn(p)
-    if not Particles.enabled then return nil end
-    local shape = p.shape or "quad"
-    if not geometry[shape] then
-        warn("casterfx: unknown particle shape " .. tostring(shape))
-        return nil
-    end
-    local entry = acquire(shape)
-    if not entry then return nil end
-
-    local tex = p.texture
-    if tex ~= nil then
-        if entry.texture ~= tex then
-            entry.mesh.texture = tex
-            entry.texture = tex
-        end
-    else
-        if entry.texture ~= false then
-            entry.mesh.texture = nil
-            entry.texture = false
-        end
-        local col = p.color or LinearColor.White
-        if not Util.colorEquals(entry.color, col) then
-            entry.mesh.color = col
-            entry.color = col
-        end
+    if not Particles.enabled then return 0 end
+    local preset = Particles.variants[p.variant]
+    if preset == nil then
+        warn("casterfx: unknown particle variant " .. tostring(p.variant))
+        return 0
     end
 
-    -- Set the transform BEFORE drawing. A mesh first drawn at zero scale seems to stay
-    -- invisible, so a parked entry always gets a fresh draw once it is positioned.
-    local size = (p.size or Vec3.oneVector) * Particles.sizeScale
-    entry.mesh.position = p.position
-    entry.mesh.rotation = p.rotation or camera.rotation
-    entry.mesh.scale = size * (p.growFrom or 1)
-    entry.mesh:draw()
-    entry.parked = false
-    Particles.stats.draws += 1
-
-    local particle = {
-        entry = entry,
-        shape = shape,
-        position = p.position,
-        velocity = p.velocity or Vec3.zeroVector,
-        size = size,
-        life = math.max(p.life or 1, 0.05),
-        age = 0,
-        gravity = p.gravity or 0,
-        drag = p.drag or 0,
-        bounce = p.bounce == true,
-        restitution = p.restitution or 0.5,
-        facing = p.facing or "billboard",
-        rotation = p.rotation or Quat.identity,
-        spin = p.spin or Vec3.zeroVector,
-        roll = p.roll or 0,
-        rollSpeed = p.rollSpeed or 0,
-        growFrom = p.growFrom or 1,
-        growTo = p.growTo or 1,
-    }
-    liveByShape[shape] = (liveByShape[shape] or 0) + 1
-    table.insert(live, particle)
-    return particle
+    local count = p.count or 1
+    local spawned = 0
+    for _ = 1, count do
+        if #particles >= Particles.maxParticles then
+            -- Recycle the oldest rather than dropping the newest: the new ones are the ones
+            -- the viewer is looking at.
+            table.remove(particles, 1)
+            Particles.stats.dropped += 1
+        end
+        local life = p.life or 1
+        table.insert(particles, {
+            preset = preset,
+            position = p.position,
+            velocity = p.velocity or Vec3.zeroVector,
+            forward = p.forward or Vec3.upVector,
+            radius = (p.radius or 0) * Particles.sizeScale,
+            thickness = preset.thickness * Particles.sizeScale,
+            colourStart = p.colourStart or preset.colourStart,
+            colourEnd = p.colourEnd or preset.colourEnd,
+            life = life,
+            age = life,
+        })
+        spawned += 1
+    end
+    Particles.stats.spawned += spawned
+    return spawned
 end
 
--- A point light that decays. Real light on the arena walls sells an explosion more
--- than any number of quads.
-function Particles.flash(position, color, intensity, radius, life)
-    -- Hard cap. A stuck light is very visible (it lights the whole goal) and there is no way
-    -- to enumerate lights we have lost track of, so never let the list grow unbounded.
+function Particles.flash(position, colour, intensity, radius, life)
+    -- Hard cap. A stuck light is very visible and there is no way to enumerate lights we
+    -- have lost track of, so never let the list grow unbounded.
     while #lights >= Particles.maxLights do
         lights[1].light:destroy()
         table.remove(lights, 1)
     end
-    local light = WorldDraw.spawnPointLight(position, intensity, Vec3.new(color.R, color.G, color.B), radius)
+    local light = WorldDraw.spawnPointLight(position, intensity, Vec3.new(colour.R, colour.G, colour.B), radius)
     if not light then return nil end
-    table.insert(lights, { light = light, age = 0, life = life, intensity = intensity })
+    table.insert(lights, { light = light, age = 0, life = life, intensity = intensity, radius = radius })
     return light
 end
 
--- Belt and braces for the "goal stayed lit" case: drop every light we know about, then ask
--- the engine to clear any we do not.
+-- Belt and braces for the "goal stayed lit" case.
 function Particles.clearLights()
     for _, l in lights do l.light:destroy() end
     lights = {}
@@ -322,63 +180,103 @@ function Particles.clearLights()
 end
 
 --------------------------------------------------------------------------------
+-- Ball trail: a ribbon, not a row of blobs
+--------------------------------------------------------------------------------
+
+local trail = {}
+
+-- Connected segments with a colour and thickness taper along the length. This is what makes
+-- a trail read as a trail; independently spawned puffs never do.
+function Particles.pushTrailPoint(position, colour, maxPoints)
+    table.insert(trail, { position = position, colour = colour })
+    while #trail > (maxPoints or 26) do table.remove(trail, 1) end
+end
+
+function Particles.clearTrail()
+    trail = {}
+end
+
+local function drawTrail(baseThickness, boost)
+    if #trail < 2 then return end
+    local n = #trail
+    for i = 2, n do
+        local a, b = trail[i - 1], trail[i]
+        -- Head of the trail is brightest and thickest, tail fades to nothing.
+        local t = (i - 1) / (n - 1)
+        local fade = t * t
+        local colour = b.colour
+        WorldDraw.drawLine(a.position, b.position,
+            colour.R * boost * fade, colour.G * boost * fade, colour.B * boost * fade,
+            baseThickness * fade * Particles.sizeScale, 0)
+    end
+end
+
+Particles.drawTrail = drawTrail
+
+--------------------------------------------------------------------------------
 -- Update
 --------------------------------------------------------------------------------
 
--- Shrink-out tail over the last 25% of life, so nothing pops out of existence
--- (cutout alpha can't cross-fade).
-local function tail(t)
-    return Util.smoothstep(math.min((1 - t) / 0.25, 1))
+-- Must be called at the START of the tick, before anything draws. Clearing inside update()
+-- would wipe whatever was drawn earlier in the same frame -- the ball trail, for one.
+function Particles.beginFrame()
+    if Particles.clearEachFrame then WorldDraw.clear() end
 end
 
 function Particles.update(dt)
-    dt = dt * Particles.simSpeed
-    if dt <= 0 then return end
+    local step = dt * Particles.simSpeed
+    if step <= 0 then return end
 
-    local camRot = camera.rotation
     local up = gravity.strength > 0 and gravity.upDirection or Vec3.upVector
 
     local i = 1
-    while i <= #live do
-        local p = live[i]
-        p.age += dt
-        local t = p.age / p.life
-        if t >= 1 then
-            release(p)
-            live[i] = live[#live]
-            table.remove(live)
+    while i <= #particles do
+        local p = particles[i]
+        p.age -= step
+        if p.age <= 0 then
+            particles[i] = particles[#particles]
+            table.remove(particles)
         else
-            if p.gravity ~= 0 then p.velocity = p.velocity - up * (p.gravity * dt) end
-            if p.drag > 0 then p.velocity = p.velocity * math.exp(-p.drag * dt) end
+            local preset = p.preset
+            local remaining = p.age / p.life          -- 1 at birth, 0 at death
+            local elapsed = 1 - remaining
 
-            local nextPos = p.position + p.velocity * dt
-            if p.bounce then
+            if preset.gravity ~= 0 then
+                p.velocity = p.velocity - up * (preset.gravity * step)
+            end
+            if preset.drag < 1 then
+                p.velocity = p.velocity * (preset.drag ^ (step * 60))
+            end
+
+            if preset.collision then
+                local nextPos = p.position + p.velocity * step
                 local hit = camera:castRay(p.position, nextPos)
                 if hit and hit.successful then
                     local n = hit.normal
-                    p.velocity = (p.velocity - n * (2 * p.velocity:dot(n))) * p.restitution
+                    local bounce = (preset.restitution or 0.5) * (0.7 + math.random() * 0.3)
+                    p.velocity = (p.velocity - n * (2 * p.velocity:dot(n))) * bounce
                     nextPos = hit.position + n * 2
                 end
-            end
-            p.position = nextPos
-
-            local mesh = p.entry.mesh
-            mesh.position = p.position
-            local mul = Util.lerp(p.growFrom, p.growTo, Util.easeOutCubic(t)) * tail(t)
-            mesh.scale = p.size * mul
-
-            if p.facing == "billboard" then
-                mesh.rotation = camRot * Quat.fromEuler(p.roll + p.rollSpeed * p.age, 0, 0)
-            elseif p.facing == "velocity" then
-                local dir = p.velocity:getSafeNormal()
-                if dir:length() > 0.001 then
-                    mesh.rotation = Quat.fromXZ(dir, up)
-                end
-            elseif p.facing == "spin" then
-                mesh.rotation = p.rotation * Quat.fromEuler(
-                    p.spin.x * p.age, p.spin.y * p.age, p.spin.z * p.age)
+                p.position = nextPos
             else
-                mesh.rotation = p.rotation
+                p.position = p.position + p.velocity * step
+            end
+
+            -- Colour ramp start -> end, and thickness ramp to zero.
+            local colour = Vec3.lerp(p.colourStart, p.colourEnd, elapsed)
+            local thickness = p.thickness * remaining + 0.1
+
+            if preset.appearance == "ember" then
+                WorldDraw.drawLine(p.position, p.position + p.velocity * (1 / 60),
+                    colour.x, colour.y, colour.z, thickness, 0)
+            elseif preset.appearance == "spark" then
+                local dir = p.velocity:getSafeNormal()
+                WorldDraw.drawLine(p.position, p.position + dir * (p.velocity:length() * (preset.length or 0.05)),
+                    colour.x, colour.y, colour.z, thickness, 0)
+            elseif preset.appearance == "ring" then
+                -- Ease out, so the shockwave leaves fast and settles.
+                local radius = p.radius + (preset.growth * Particles.sizeScale) * Util.easeOutCubic(elapsed)
+                drawCircle(p.position, radius, p.forward, colour, thickness, preset.resolution or 32)
             end
 
             i += 1
@@ -388,7 +286,7 @@ function Particles.update(dt)
     local li = 1
     while li <= #lights do
         local l = lights[li]
-        l.age += dt
+        l.age += step
         if l.age >= l.life then
             l.light:destroy()
             lights[li] = lights[#lights]
@@ -399,59 +297,56 @@ function Particles.update(dt)
         end
     end
 
-    Particles.stats.live = #live
-    Particles.stats.meshes = #entries
+    Particles.stats.live = #particles
     Particles.stats.lights = #lights
 end
 
 function Particles.clear()
-    for _, p in live do release(p) end
-    live = {}
+    particles = {}
+    trail = {}
     Particles.clearLights()
+    WorldDraw.clear()
 end
 
 function Particles.destroyAll()
     Particles.clear()
-    for _, e in entries do e.mesh:destroy() end
-    entries = {}
-    freeByShape = {}
-    liveByShape = {}
-    sprites = {}
-    meshSpawnFailed = false
-    Particles.stats = { live = 0, meshes = 0, draws = 0, dropped = 0, lights = 0 }
+    Particles.stats = { live = 0, lights = 0, dropped = 0, spawned = 0 }
 end
 
--- Spawn one of every shape a short distance in front of the camera, at a size that cannot be
--- missed. If this shows nothing, the problem is mesh rendering itself, not the effects.
+--------------------------------------------------------------------------------
+-- Debug
+--------------------------------------------------------------------------------
+
+-- One of everything, right in front of the camera, at a size that cannot be missed.
 function Particles.testBurst()
     local rot = camera.rotation
-    local base = camera.position + rot:getForwardVector() * 500
+    local base = camera.position + rot:getForwardVector() * 600
     local right = rot:getRightVector()
-    local shapes = { "quad", "shard", "ring", "disc" }
-    local spawned = 0
-    for i, shape in shapes do
-        local offset = right * ((i - 2.5) * 160)
-        local p = Particles.spawn({
-            shape = shape,
-            position = base + offset,
-            color = LinearColor.new(i == 1 and 1 or 0, i == 2 and 1 or 0.4, i == 3 and 1 or 0.2, 1),
-            size = Vec3.new(60, 60, 60),
-            life = 6,
-            facing = shape == "quad" and "billboard" or "fixed",
-            rotation = rot,
-        })
-        if p then spawned += 1 end
-    end
-    print(("casterfx test burst: %d/%d spawned, %d meshes pooled, spawnMesh failed=%s")
-        :format(spawned, #shapes, #entries, tostring(meshSpawnFailed)))
-    return spawned, #shapes
-end
+    local up = rot:getUpVector()
 
---------------------------------------------------------------------------------
--- Self-test: asserts the invariants that are easy to get wrong and impossible to
--- eyeball (0-based indices, index range, UV/normal counts, pool accounting).
--- Wired to a button in the Debug tab.
---------------------------------------------------------------------------------
+    local total = 0
+    total += Particles.spawn({
+        variant = "goalRing", position = base, forward = rot:getForwardVector(),
+        life = 3, radius = 60,
+    })
+    for _ = 1, 30 do
+        total += Particles.spawn({
+            variant = "goalEmber", position = base + right * 200,
+            velocity = Util.randomUnit() * Util.randomRange(300, 900), life = 2.5,
+        })
+    end
+    for _ = 1, 20 do
+        total += Particles.spawn({
+            variant = "goalSpark", position = base - right * 200,
+            velocity = Util.randomUnit() * Util.randomRange(1500, 3000), life = 1.2,
+        })
+    end
+    Particles.flash(base + up * 100, LinearColor.new(1, 1, 1, 1), 8000, 800, 1.5)
+
+    print(("casterfx test burst: %d particles, %d live, %d lights")
+        :format(total, #particles, #lights))
+    return total
+end
 
 function Particles.selfTest()
     local problems = {}
@@ -459,48 +354,42 @@ function Particles.selfTest()
         if not cond then table.insert(problems, msg) end
     end
 
-    for name, g in pairs(geometry) do
-        local vn = #g.vertices
-        check(vn > 0, name .. ": no vertices")
-        check(#g.normals == vn, name .. ": normals " .. #g.normals .. " ~= vertices " .. vn)
-        check(#g.uvs == vn, name .. ": uvs " .. #g.uvs .. " ~= vertices " .. vn)
-        check(#g.triangles % 3 == 0, name .. ": triangle list not a multiple of 3")
-        local minI, maxI = math.huge, -1
-        for _, idx in g.triangles do
-            if idx < minI then minI = idx end
-            if idx > maxI then maxI = idx end
-        end
-        -- mesh.triangles is 0-based: index 0 must be used, and vn must never appear.
-        check(minI == 0, name .. ": min index " .. minI .. " (expected 0, list is 0-based)")
-        check(maxI == vn - 1, name .. ": max index " .. maxI .. " (expected " .. (vn - 1) .. ")")
+    for name, v in pairs(Particles.variants) do
+        check(v.appearance == "ember" or v.appearance == "ring" or v.appearance == "spark",
+            name .. ": unknown appearance " .. tostring(v.appearance))
+        check(v.colourStart ~= nil and v.colourEnd ~= nil, name .. ": missing colour ramp")
+        check(v.thickness and v.thickness > 0, name .. ": thickness must be positive")
+        -- HDR is the point: a variant capped at 1 will look like a dull stick.
+        local peak = math.max(v.colourStart.x, v.colourStart.y, v.colourStart.z)
+        check(peak > 1, name .. ": colourStart peak is " .. peak .. ", needs >1 to bloom")
     end
 
-    -- Force a known state: the test asserts on exact lifetimes, and a user's
-    -- sim-speed or an off toggle would make it fail for the wrong reason.
     local wasEnabled, wasSpeed = Particles.enabled, Particles.simSpeed
     Particles.enabled, Particles.simSpeed = true, 1
 
-    local before = #live
-    local p = Particles.spawn({
-        shape = "shard", position = Vec3.zeroVector, life = 0.1,
-        color = LinearColor.new(1, 0, 0, 1), size = Vec3.oneVector,
+    local before = #particles
+    local spawned = Particles.spawn({
+        variant = "goalEmber", position = Vec3.zeroVector,
+        velocity = Vec3.new(100, 0, 0), life = 0.1,
     })
-    check(p ~= nil, "spawn returned nil")
-    check(#live == before + 1, "live count did not increase on spawn")
-    if p then
-        Particles.update(0.2) -- outlives it
-        check(#live == before, "particle was not released after its life expired")
-        check(p.entry.mesh.scale:isNearlyZero(), "released mesh was not parked at zero scale")
-    end
+    check(spawned == 1, "spawn returned " .. spawned)
+    check(#particles == before + 1, "particle count did not increase")
+    Particles.update(0.25)
+    check(#particles == before, "particle outlived its lifespan")
 
     Particles.enabled, Particles.simSpeed = wasEnabled, wasSpeed
 
     if #problems == 0 then
-        print("casterfx selftest: PASS (" .. #entries .. " meshes pooled)")
+        print("casterfx selftest: PASS")
         return true, "PASS"
     end
     for _, msg in problems do issue("casterfx selftest: " .. msg) end
     return false, #problems .. " failure(s), see Camera Logs"
+end
+
+-- Kept so diagnostics can report it; the particle system no longer uses meshes at all.
+function Particles.meshSpawnFailed()
+    return false
 end
 
 return Particles

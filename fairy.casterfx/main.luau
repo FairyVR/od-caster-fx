@@ -28,8 +28,11 @@ Util.initializeConfig({
     writeWanted = true,
     autoSelectArena = true,
     autoBindProfile = true,
-    freecamSpeed = 900,
-    freecamSensitivity = 0.25,
+    -- Defaults taken from UVC's freecam; the first attempt at these was unusable.
+    freecamSpeed = 1600,
+    freecamSensitivity = 3.6,
+    freecamSmoothing = 0.55,
+    freecamRequireRightMouse = false,
 })
 
 local matches = {}
@@ -73,10 +76,13 @@ local function pushSettings()
     Particles.enabled = v.enabled
     Particles.simSpeed = v.simSpeed
     Particles.sizeScale = v.sizeScale
-    Particles.maxMeshes = math.floor(v.maxMeshes)
+    Particles.maxParticles = math.floor(v.maxParticles)
 
     local s = Effects.settings
     s.intensity = v.intensity
+    s.hdrBoost = v.hdrBoost
+    s.trailLength = v.trailLength
+    s.trailBoost = v.trailBoost
     s.goalEnabled = v.goalEnabled
     s.goalShockwaves = v.goalShockwaves
     s.goalDebris = v.goalDebris
@@ -91,6 +97,8 @@ local function pushSettings()
 
     Freecam.speed = config.freecamSpeed
     Freecam.lookSensitivity = config.freecamSensitivity
+    Freecam.lookSmoothing = config.freecamSmoothing
+    Freecam.requireRightMouse = config.freecamRequireRightMouse
 end
 
 local function selectIndex(i)
@@ -192,6 +200,9 @@ function tick(dt)
     totalTime += dt
     pushSettings()
 
+    -- Lines are redrawn every frame, so the clear has to happen before anything draws.
+    Particles.beginFrame()
+
     refreshTimer += dt
     if refreshTimer > 3 then
         refreshTimer = 0
@@ -284,9 +295,15 @@ local function cameraTab()
     cam.enabled = Gui.checkbox("Enable sideline camera", cam.enabled)
     Freecam.enabled = Gui.checkbox("Debug freecam (for placing logos)", Freecam.enabled)
     if Freecam.enabled then
-        config.freecamSpeed = Gui.sliderFloat("Freecam speed", config.freecamSpeed, 100, 5000)
+        Gui.text("WASD move, R/F up-down, mouse look, Shift fast, Ctrl slow, scroll speed")
+        config.freecamSpeed = Gui.sliderFloat("Speed (cm/s)", config.freecamSpeed, 100, 20000)
         config.freecamSensitivity = Gui.sliderFloat("Look sensitivity",
-            config.freecamSensitivity, 0.02, 1.5)
+            config.freecamSensitivity, 0.2, 12)
+        config.freecamSmoothing = Gui.sliderFloat("Look smoothing", config.freecamSmoothing, 0, 0.95)
+        config.freecamRequireRightMouse = Gui.checkbox("Only look while right mouse held",
+            config.freecamRequireRightMouse)
+        Gui.text(string.format("yaw %.0f  pitch %.0f  speed %.0f",
+            Freecam.debug.yaw, Freecam.debug.pitch, Freecam.debug.speed))
         if Gui.button(Icon.Crosshairs .. " Snap freecam to arena") then Freecam.snapTo(selected) end
     end
 
@@ -464,9 +481,11 @@ local function vfxTab()
     local v = Profiles.active().vfx
     v.enabled = Gui.checkbox("Enable VFX", v.enabled)
     v.intensity = Gui.sliderFloat("Intensity (counts)", v.intensity, 0.1, 3)
-    v.sizeScale = Gui.sliderFloat("Particle size scale", v.sizeScale, 0.2, 12)
+    v.sizeScale = Gui.sliderFloat("Size scale", v.sizeScale, 0.2, 6)
+    -- Values above 1 bloom. This is the knob that decides whether particles glow.
+    v.hdrBoost = Gui.sliderFloat("HDR brightness (bloom)", v.hdrBoost, 1, 60)
     v.simSpeed = Gui.sliderFloat("Sim speed", v.simSpeed, 0.1, 2)
-    v.maxMeshes = Gui.sliderInt("Mesh budget", math.floor(v.maxMeshes), 50, 1200)
+    v.maxParticles = Gui.sliderInt("Particle budget", math.floor(v.maxParticles), 100, 4000)
 
     Gui.separatorText("Goal explosion")
     v.goalEnabled = Gui.checkbox("Goal explosion", v.goalEnabled)
@@ -481,6 +500,8 @@ local function vfxTab()
     v.kickoffEnabled = Gui.checkbox("Kickoff burst", v.kickoffEnabled)
     v.trailEnabled = Gui.checkbox("Ball trail", v.trailEnabled)
     v.trailInterval = Gui.sliderFloat("Trail spacing (s)", v.trailInterval, 0.008, 0.15)
+    v.trailLength = Gui.sliderInt("Trail length (points)", math.floor(v.trailLength), 2, 120)
+    v.trailBoost = Gui.sliderFloat("Trail brightness", v.trailBoost, 1, 50)
     v.impactEnabled = Gui.checkbox("Impact rings", v.impactEnabled)
     v.impactThreshold = Gui.sliderFloat("Impact threshold (cm/s)", v.impactThreshold, 200, 3000)
 
@@ -596,13 +617,10 @@ local function debugTab()
 
     Gui.separatorText("Runtime")
     local st = Particles.stats
-    Gui.text("Particles live: " .. st.live .. "   meshes: " .. st.meshes
-        .. " / " .. math.floor(Profiles.active().vfx.maxMeshes))
-    Gui.text("Draws: " .. st.draws .. "   recycled: " .. st.dropped .. "   lights: " .. st.lights)
-    if Particles.meshSpawnFailed() then
-        Gui.textColored(LinearColor.new(1, 0.4, 0.4, 1),
-            "spawnMesh() returned nil -- no meshes can be drawn at all.")
-    end
+    Gui.text("Particles live: " .. st.live
+        .. " / " .. math.floor(Profiles.active().vfx.maxParticles))
+    Gui.text("Spawned: " .. st.spawned .. "   recycled: " .. st.dropped
+        .. "   lights: " .. st.lights)
     if selected then
         Gui.text("Slot: " .. selected.slotId .. "   running: " .. tostring(selected.isRunning))
         Gui.text("Score: " .. selected.home.score .. " - " .. selected.away.score)
