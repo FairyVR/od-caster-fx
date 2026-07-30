@@ -15,6 +15,7 @@ local Util = require("util")
 local Particles = require("particles")
 local Sideline = require("sideline")
 local Profiles = require("profiles")
+local Freecam = require("freecam")
 
 local Diagnostics = {}
 
@@ -79,6 +80,29 @@ local function probeLight(r)
     r.check("point light intensity is writable", ok,
         "if this fails, decaying flashes cannot dim and would stay lit")
     light:destroy()
+end
+
+-- Pure maths, no game state needed. Verifies the yaw/pitch convention actually round-trips
+-- against the engine's own Quat, which is what the freecam's orientation depends on. The
+-- upside-down entry bug came from getting exactly this wrong.
+local function probeAngles(r)
+    local worst, worstCase = 0, ""
+    for _, pair in { { 0, 0 }, { 45, 20 }, { -120, -35 }, { 179, 60 }, { -90, -80 } } do
+        local yaw, pitch = pair[1], pair[2]
+        local forward = Quat.fromEuler(0, pitch, yaw):getForwardVector()
+        local gotYaw, gotPitch = Freecam.anglesFromForward(forward)
+        -- Yaw wraps at +/-180, so compare the shortest angular distance.
+        local dYaw = math.abs((gotYaw - yaw + 180) % 360 - 180)
+        local dPitch = math.abs(gotPitch - pitch)
+        local err = math.max(dYaw, dPitch)
+        if err > worst then
+            worst = err
+            worstCase = ("yaw %d pitch %d -> yaw %.1f pitch %.1f"):format(yaw, pitch, gotYaw, gotPitch)
+        end
+    end
+    r.check("freecam yaw/pitch round-trips through the engine Quat", worst < 1,
+        ("worst error %.2f deg (%s)"):format(worst, worstCase))
+    return { worstAngleError = worst, worstCase = worstCase }
 end
 
 local function probeFiles(r)
@@ -246,6 +270,7 @@ function Diagnostics.run(match)
     probeMesh(r)
     probeLight(r)
     probeFiles(r)
+    report.angles = probeAngles(r)
     report.match = snapshotMatch(r, match)
     report.framing = snapshotFraming(r, match)
     report.particles = snapshotParticles(r)

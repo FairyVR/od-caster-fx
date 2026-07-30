@@ -29,12 +29,30 @@ local yaw, pitch = 0, 0
 local lookTarget = Vec2.zeroVector      -- accumulated, unconsumed look input
 local initialised = false
 
+-- Yaw and pitch from a DIRECTION, never from euler decomposition.
+--
+-- Reading camera.rotation:euler() and rebuilding with Quat.fromEuler(0, pitch, yaw) looks
+-- like it drops roll, but it does not: the pitch and yaw of a rolled rotation only
+-- reconstruct that rotation *together with* its roll term. Throw the roll away and you get a
+-- different orientation, frequently upside down. The sideline camera produces rolled
+-- rotations routinely, because it aims with lookAt using the ARENA's up vector rather than
+-- the world's, so entering freecam from it hit this every time.
+--
+-- Unreal convention: X forward, Y right, Z up; positive pitch looks up.
+local function anglesFromForward(forward)
+    local f = forward:getSafeNormal()
+    if f:length() < 0.001 then return 0, 0 end
+    local yawDegrees = math.deg(math.atan2(f.y, f.x))
+    local pitchDegrees = math.deg(math.asin(math.clamp(f.z, -1, 1)))
+    return yawDegrees, math.clamp(pitchDegrees, -89, 89)
+end
+
+Freecam.anglesFromForward = anglesFromForward
+
 -- Seed from wherever the camera currently is, so enabling freecam never jumps the view.
 function Freecam.takeOver()
     position = camera.position
-    local euler = camera.rotation:euler()   -- (roll, pitch, yaw) degrees
-    pitch = euler.y
-    yaw = euler.z
+    yaw, pitch = anglesFromForward(camera.rotation:getForwardVector())
     lookTarget = Vec2.zeroVector
     initialised = true
 end
@@ -42,12 +60,9 @@ end
 function Freecam.snapTo(match)
     if match == nil then return end
     local rot = match.transform.rotation
-    local worldUp = rot:getUpVector()
-    position = match.transform.position + rot:getForwardVector() * 2200 + worldUp * 700
-    local look = (match.transform.position + worldUp * 300 - position):getSafeNormal()
-    local e = Quat.fromXZ(look, worldUp):euler()
-    pitch = e.y
-    yaw = e.z
+    local arenaUp = rot:getUpVector()
+    position = match.transform.position + rot:getForwardVector() * 2200 + arenaUp * 700
+    yaw, pitch = anglesFromForward(match.transform.position + arenaUp * 300 - position)
     lookTarget = Vec2.zeroVector
     initialised = true
 end

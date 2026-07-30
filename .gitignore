@@ -14,7 +14,8 @@ fairy.casterfx/wanted.json
 tools/
 
 # Empty files some other tool keeps dropping in the working directory, named after
-# whatever numeric value it redirected ("0", "900", "0.999"). Anchored so that real
+# whatever value it redirected ("0", "900", "0.999", "yaw"). Anchored so that real
 # assets with digit-leading names, like logos/0RB.png, are unaffected.
 /[0-9]*
 /fairy.casterfx/[0-9]*
+/yaw
