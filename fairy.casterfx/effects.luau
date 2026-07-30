@@ -228,8 +228,12 @@ function Effects.ballTrail(dt, position, velocity, color)
     local speed = velocity and velocity:length() or 0
     trailTimer += dt
     local interval = math.max(s.trailInterval, 0.008)
-    while trailTimer >= interval do
+    -- Cap the catch-up: after a hitch or the first frame following a load, dt can be large
+    -- enough to ask for hundreds of puffs at once and blow the whole particle budget.
+    local budget = 8
+    while trailTimer >= interval and budget > 0 do
         trailTimer -= interval
+        budget -= 1
         local scaled = math.clamp(speed / 1500, 0, 1)
         -- Coloured part is untextured: a textured mesh ignores `color`, and the
         -- trail must be the possessing team's colour.
@@ -253,6 +257,7 @@ function Effects.ballTrail(dt, position, velocity, color)
             end
         end
     end
+    if budget == 0 then trailTimer = 0 end
 end
 
 --------------------------------------------------------------------------------

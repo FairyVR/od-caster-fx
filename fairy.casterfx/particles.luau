@@ -162,10 +162,19 @@ end
 
 -- Oldest live particle of this shape, so a burst that exceeds the budget recycles
 -- its own tail rather than dropping the new (more visible) particles.
+-- ponytail: scans at most SCAN_LIMIT candidates, so this is "old enough" rather than
+-- strictly oldest. A full scan per spawn is O(live) and a goal burst spawns hundreds in
+-- one frame. Swap in a per-shape age-ordered structure if that ever proves visible.
+local SCAN_LIMIT = 64
+
 local function stealOldest(shape)
-    local bestIdx, bestAge = nil, -1
+    local bestIdx, bestAge, seen = nil, -1, 0
     for i, p in live do
-        if p.shape == shape and p.age > bestAge then bestAge = p.age; bestIdx = i end
+        if p.shape == shape then
+            if p.age > bestAge then bestAge = p.age; bestIdx = i end
+            seen += 1
+            if seen >= SCAN_LIMIT then break end
+        end
     end
     if not bestIdx then return nil end
     local p = live[bestIdx]

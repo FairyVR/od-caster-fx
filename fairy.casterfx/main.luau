@@ -1,7 +1,9 @@
--- Fairy Caster FX -- team logo overlays + over-the-top VFX for Orion Drift casting.
+-- Fairy Caster FX -- sideline camera, team logo overlays, and VFX for Orion Drift casting.
 --
--- This is an OVERLAY, not a camera. alwaysTick keeps it running while any other camera
--- is active, so it draws on top of Plutus Autocaster, freecam, or anything else.
+-- Two modes, decided by whether this script owns the camera:
+--   ACTIVE  -- the sideline camera drives the view and the overlays render on top.
+--   OVERLAY -- alwaysTick keeps it running while ANOTHER camera is active (Plutus
+--              Autocaster, freecam, anything). The camera is never written to.
 --
 -- It renders with meshes only, never WorldDraw lines, on purpose: other scripts call
 -- WorldDraw.clear() every frame (Plutus does) which would wipe our lines but leaves
@@ -9,9 +11,11 @@
 
 local Util = require("util")
 local Match = require("match")
-local Logos = require("logos")
+-- "scoreboard", not "logos": require("logos") resolves to the logos/ asset folder.
+local Scoreboard = require("scoreboard")
 local Particles = require("particles")
 local Effects = require("effects")
+local Sideline = require("sideline")
 
 Util.initializeConfig({
     logosEnabled = true,
@@ -39,6 +43,27 @@ Util.initializeConfig({
 
     autoSelectArena = true,
     showDebug = false,
+
+    -- Sideline camera. Only applies when this script is the active/followed camera.
+    camEnabled = true,
+    camSideDistance = 2600,
+    camLengthLimit = 2200,
+    camHeightOffset = 220,
+    camMaxHeight = 1250,
+    camMinHeightAboveGround = 130,
+    camRiserScale = 1.0,
+    camHookScale = 1.0,
+    camSwitchThreshold = 400,
+    camSwitchInstant = true,
+    camLead = 0.45,
+    camPositionSmoothing = 0.25,
+    camRotationSmoothing = 0.12,
+    camFovSmoothing = 0.2,
+    camAutoZoom = true,
+    camZoomFraction = 0.16,
+    camFovMin = 35,
+    camFovMax = 95,
+    camFovFixed = 70,
 })
 
 local matches = {}
@@ -73,6 +98,27 @@ local function pushSettings()
     s.trailEnabled = config.trailEnabled
     s.trailInterval = config.trailInterval
     s.impactEnabled = config.impactEnabled
+
+    local c = Sideline.settings
+    c.enabled = config.camEnabled
+    c.sideDistance = config.camSideDistance
+    c.lengthLimit = config.camLengthLimit
+    c.heightOffset = config.camHeightOffset
+    c.maxHeight = config.camMaxHeight
+    c.minHeightAboveGround = config.camMinHeightAboveGround
+    c.riserScale = config.camRiserScale
+    c.hookScale = config.camHookScale
+    c.switchThreshold = config.camSwitchThreshold
+    c.switchInstant = config.camSwitchInstant
+    c.lead = config.camLead
+    c.positionSmoothing = config.camPositionSmoothing
+    c.rotationSmoothing = config.camRotationSmoothing
+    c.fovSmoothing = config.camFovSmoothing
+    c.autoZoom = config.camAutoZoom
+    c.zoomFraction = config.camZoomFraction
+    c.fovMin = config.camFovMin
+    c.fovMax = config.camFovMax
+    c.fovFixed = config.camFovFixed
 end
 
 local function selectIndex(i)
@@ -80,6 +126,10 @@ local function selectIndex(i)
     selectedIndex = math.clamp(i, 1, #matches)
     selected = matches[selectedIndex]
     Effects.resetTrail()
+    -- Cut to the new arena instead of sweeping across the station, and don't let the
+    -- old arena's ball velocity fire a phantom impact ring.
+    Sideline.reset()
+    prevBallVelocity = Vec3.zeroVector
 end
 
 local function refreshMatches(force)
@@ -96,9 +146,10 @@ local function refreshMatches(force)
 end
 
 -- Whichever arena the camera is actually looking from. Beats making the user pick
--- when a station hosts several courts.
+-- when a station hosts several courts. Skipped while we own the camera, since then the
+-- camera sits at the selected arena by construction and this could never move off it.
 local function autoSelect()
-    if #matches < 2 then return end
+    if #matches < 2 or Sideline.isDriving() then return end
     local pos = camera.position
     local bestIdx, bestDist = selectedIndex, math.huge
     for i, m in matches do
@@ -137,7 +188,7 @@ function main()
     alwaysTick = true
     math.randomseed(math.floor(os.clock() * 1000) % 2147483647)
     pushSettings()
-    Logos.rescan()
+    Scoreboard.rescan()
     refreshMatches(true)
 end
 
@@ -151,11 +202,10 @@ end
 
 function onUnload()
     Particles.destroyAll()
-    Logos.destroy()
+    Scoreboard.destroy()
 end
 
 function tick(dt)
-    alwaysTick = true
     totalTime += dt
     pushSettings()
 
@@ -172,6 +222,10 @@ function tick(dt)
     end
 
     selected:tick()
+
+    -- Before the overlays: billboarded particles and face-camera logos read camera.rotation,
+    -- so the camera has to be where it is going to be this frame first.
+    Sideline.update(dt, selected)
 
     for _, event in selected.events do
         if event.kind == "goal" then
@@ -199,13 +253,13 @@ function tick(dt)
         prevBallVelocity = Vec3.zeroVector
     end
 
-    Logos.update(selected)
+    Scoreboard.update(selected)
 
     if config.writeWanted then
         wantedTimer += dt
         if wantedTimer > 2 then
             wantedTimer = 0
-            Logos.writeWanted(selected)
+            Scoreboard.writeWanted(selected)
         end
     end
 
@@ -242,7 +296,7 @@ local function slotEditor(label, side, slot)
     slot.flipV = Gui.checkbox("Flip vertically##" .. side, slot.flipV)
 
     if Gui.button(Icon.Copy .. " Mirror to other side##" .. side) then
-        local slots = Logos.slotsFor(selected and selected.type, selected and selected.arenaHeight)
+        local slots = Scoreboard.slotsFor(selected and selected.type, selected and selected.arenaHeight)
         local other = side == "home" and slots.away or slots.home
         other.x = slot.x; other.y = -slot.y; other.z = slot.z
         other.roll = slot.roll; other.pitch = slot.pitch; other.yaw = -slot.yaw
@@ -263,21 +317,29 @@ local function logosTab()
 
     Gui.text("Arena: " .. selected.name .. "  (" .. tostring(selected.type) .. ")")
     Gui.text("Home: " .. (selected.home.name ~= "" and selected.home.name or "-")
-        .. "   [" .. Logos.status.home .. "]")
+        .. "   [" .. Scoreboard.status.home .. "]")
     Gui.text("Away: " .. (selected.away.name ~= "" and selected.away.name or "-")
-        .. "   [" .. Logos.status.away .. "]")
+        .. "   [" .. Scoreboard.status.away .. "]")
+
+    -- Observed live: an ordinary lobby reports the same teamName for both sides, because
+    -- it is the in-game team name and not the ODC one. Auto-match cannot tell the sides
+    -- apart in that case, so say so instead of quietly showing one crest twice.
+    if selected.home.name ~= "" and selected.home.name == selected.away.name then
+        Gui.textColored(LinearColor.new(1, 0.8, 0.3, 1),
+            "Both sides report the same team name -- set the overrides below.")
+    end
 
     Gui.separator()
     if Gui.button(Icon.SyncAlt .. " Rescan logos/ folder") then
-        Logos.rescan()
+        Scoreboard.rescan()
     end
     Gui.sameLine()
-    Gui.text(#Logos.files() .. " image(s) found")
+    Gui.text(#Scoreboard.files() .. " image(s) found")
 
     config.writeWanted = Gui.checkbox("Write wanted.json for get-logos.ps1", config.writeWanted)
 
     Gui.separatorText("Manual override (blank = auto by team name)")
-    local files = Logos.files()
+    local files = Scoreboard.files()
     for _, side in { "home", "away" } do
         local current = config.logoOverride[side]
         if Gui.beginCombo(side == "home" and "Home image" or "Away image",
@@ -291,7 +353,7 @@ local function logosTab()
     end
 
     Gui.separatorText("Placement -- nudge until it covers the in-game crest")
-    local slots = Logos.slotsFor(selected.type, selected.arenaHeight)
+    local slots = Scoreboard.slotsFor(selected.type, selected.arenaHeight)
     slotEditor(Icon.Home .. " Home slot", "home", slots.home)
     slotEditor(Icon.PlaneDeparture .. " Away slot", "away", slots.away)
 
@@ -302,8 +364,8 @@ local function logosTab()
     Gui.sameLine()
     if Gui.button(Icon.Undo .. " Reset this arena") then
         config.logoSlots[selected.type or "unknown"] = {
-            home = Logos.defaultSlot("home", selected.arenaHeight),
-            away = Logos.defaultSlot("away", selected.arenaHeight),
+            home = Scoreboard.defaultSlot("home", selected.arenaHeight),
+            away = Scoreboard.defaultSlot("away", selected.arenaHeight),
         }
     end
 end
@@ -349,6 +411,61 @@ local function vfxTab()
     end
 end
 
+local function cameraTab()
+    config.camEnabled = Gui.checkbox("Enable sideline camera", config.camEnabled)
+    if Sideline.isDriving() then
+        Gui.textColored(LinearColor.new(0.4, 1, 0.4, 1), "Driving the camera.")
+    else
+        Gui.textColored(LinearColor.new(1, 0.8, 0.3, 1),
+            "Overlay mode -- another camera is active, so the view is not touched.")
+        Gui.text("Activate this camera in F2 to have it drive the shot.")
+    end
+    Gui.text(string.format("Side: %s   FOV: %.0f   Ground lift: %.0f",
+        Sideline.debug.side > 0 and "+" or "-", Sideline.debug.fov, Sideline.debug.groundLift))
+    if not Sideline.debug.hasBall then
+        Gui.text("No ball found -- framing the arena centre.")
+    end
+
+    Gui.separatorText("Framing")
+    config.camSideDistance = Gui.sliderFloat("Touchline distance", config.camSideDistance, 500, 8000)
+    config.camLengthLimit = Gui.sliderFloat("Track length limit", config.camLengthLimit, 0, 9000)
+    config.camHeightOffset = Gui.sliderFloat("Height above ball", config.camHeightOffset, -500, 1500)
+    config.camMaxHeight = Gui.sliderFloat("Max height", config.camMaxHeight, 0, 3000)
+    config.camMinHeightAboveGround = Gui.sliderFloat("Min above floor",
+        config.camMinHeightAboveGround, 0, 600)
+
+    Gui.separatorText("Endzone behaviour")
+    config.camRiserScale = Gui.sliderFloat("Riser strength", config.camRiserScale, 0, 4)
+    config.camHookScale = Gui.sliderFloat("Inward hook strength", config.camHookScale, 0, 4)
+
+    Gui.separatorText("Side switching")
+    config.camSwitchThreshold = Gui.sliderFloat("Switch threshold",
+        config.camSwitchThreshold, 0, 3000)
+    config.camSwitchInstant = Gui.checkbox("Hard cut on switch", config.camSwitchInstant)
+    if Gui.button(Icon.ExchangeAlt .. " Flip side now") then Sideline.flipSide() end
+
+    Gui.separatorText("Aim and smoothing")
+    config.camLead = Gui.sliderFloat("Velocity lead (s)", config.camLead, 0, 1.5)
+    config.camPositionSmoothing = Gui.sliderFloat("Position smoothing",
+        config.camPositionSmoothing, 0, 1.5)
+    config.camRotationSmoothing = Gui.sliderFloat("Rotation smoothing",
+        config.camRotationSmoothing, 0, 1.5)
+    config.camFovSmoothing = Gui.sliderFloat("FOV smoothing", config.camFovSmoothing, 0, 1.5)
+
+    Gui.separatorText("Zoom")
+    config.camAutoZoom = Gui.checkbox("Auto zoom", config.camAutoZoom)
+    config.camZoomFraction = Gui.sliderFloat("Ball screen fraction",
+        config.camZoomFraction, 0.02, 0.6)
+    config.camFovMin = Gui.sliderFloat("FOV min", config.camFovMin, 1, 170)
+    config.camFovMax = Gui.sliderFloat("FOV max", config.camFovMax, 1, 170)
+    config.camFovFixed = Gui.sliderFloat("Fixed FOV", config.camFovFixed, 1, 170)
+
+    Gui.separator()
+    if Gui.button(Icon.Save .. " Save camera settings") then
+        if saveConfig() then print("casterfx: camera settings saved") end
+    end
+end
+
 local function debugTab()
     Gui.text("Arenas detected: " .. #matches)
     config.autoSelectArena = Gui.checkbox("Auto-select nearest arena", config.autoSelectArena)
@@ -385,9 +502,15 @@ local function debugTab()
 end
 
 function onGui()
-    Gui.text("Fairy Caster FX -- overlay, runs over any active camera")
+    Gui.text(Sideline.isDriving()
+        and "Fairy Caster FX -- driving the camera"
+        or "Fairy Caster FX -- overlay mode, another camera is active")
     Gui.separator()
     if not Gui.beginTabBar("casterfx") then return end
+    if Gui.beginTabItem(Icon.Video .. " Camera") then
+        cameraTab()
+        Gui.endTabItem()
+    end
     if Gui.beginTabItem(Icon.Image .. " Logos") then
         logosTab()
         Gui.endTabItem()

@@ -1,5 +1,8 @@
--- Logos: static team-logo quads anchored to the arena, for covering the in-game
+-- Scoreboard: static team-logo quads anchored to the arena, for covering the in-game
 -- scoreboard crests.
+--
+-- Named scoreboard, not logos, because `require("logos")` resolves to the logos/ ASSET
+-- FOLDER rather than to this file. Do not rename it back.
 --
 -- Placement is config-driven per arena type and edited live in the GUI, because the
 -- scoreboard offset is not exposed anywhere in the API and differs per gamemode.
@@ -230,6 +233,8 @@ end
 function Logos.update(match)
     if match == nil or config.logosEnabled == false then
         hide("home"); hide("away")
+        Logos.status.home = match == nil and "no arena" or "disabled"
+        Logos.status.away = Logos.status.home
         return
     end
     local slots = Logos.slotsFor(match.type, match.arenaHeight)
@@ -249,10 +254,24 @@ function Logos.writeWanted(match)
     local key = home .. "\0" .. away
     if key == lastWanted then return end
     lastWanted = key
+
+    -- Both sides frequently report the SAME teamName (it is the in-game team name, not the
+    -- ODC one, and an ordinary lobby leaves both at the station default). Deduplicate so the
+    -- fetcher isn't asked for the same crest twice.
+    local teams, stems, seen = {}, {}, {}
+    for _, name in { home, away } do
+        if name ~= "" and not seen[name] then
+            seen[name] = true
+            table.insert(teams, name)
+            table.insert(stems, Util.sanitizeTeamName(name))
+        end
+    end
+
     local payload = {
-        teams = { home, away },
-        stems = { Util.sanitizeTeamName(home), Util.sanitizeTeamName(away) },
+        teams = teams,
+        stems = stems,
         slotId = match.slotId,
+        ambiguous = home == away,
     }
     local text = LuauJson.serialize(payload, true)
     if text == "" then return end

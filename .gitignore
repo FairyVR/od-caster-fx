@@ -10,6 +10,11 @@ fairy.casterfx/wanted.json
 # Tooling state
 .claude-flow/
 
-# Empty files a stray shell redirect left behind
-/0
-/900
+# Downloaded analyzer binaries, fetched on demand by check.ps1
+tools/
+
+# Empty files some other tool keeps dropping in the working directory, named after
+# whatever numeric value it redirected ("0", "900", "0.999"). Anchored so that real
+# assets with digit-leading names, like logos/0RB.png, are unaffected.
+/[0-9]*
+/fairy.casterfx/[0-9]*

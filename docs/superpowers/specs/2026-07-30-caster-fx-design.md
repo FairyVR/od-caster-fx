@@ -6,18 +6,29 @@ Package: `fairy.casterfx`
 
 ## Goal
 
-Raise Orion Drift competitive broadcast production value with two things:
+Raise Orion Drift competitive broadcast production value with three things:
 
 1. **Static team logos** rendered over the in-game scoreboard crests, sourced from Orion
    Drift Competitive team profiles.
 2. **Over-the-top VFX** — goal explosions, kickoff bursts, ball trail, impact rings —
    built on the new custom-mesh API rather than line draws.
+3. **A ball-following sideline camera.**
 
-A ball-following autocam was in the original request but is **out of scope**: Plutus
-Autocaster's `AutoCast` mode already is one (orbit bias, velocity lead, raycast collision
-and player avoidance, goal cam, kickoff orbit). Rebuilding it would duplicate working
-code. This package is an overlay that renders *on top of* whatever camera is active,
-Plutus included.
+### Revision: the camera came back into scope
+
+The first version deferred the camera to Plutus Autocaster's `AutoCast` mode and shipped
+overlay-only. That failed in practice: activating `fairy.casterfx` in F2 left the camera
+parked at the origin, because an overlay never writes `camera.position`. Selecting an arena
+appeared to do nothing.
+
+So the package now has two modes, decided by whether it owns the camera:
+
+- **ACTIVE** — `sideline.luau` drives the shot and the overlays render on top.
+- **OVERLAY** — `alwaysTick` keeps it running under another camera, and the camera is never
+  written to.
+
+`Sideline.isDriving()` is the single predicate, checked in one place. The GUI states which
+mode it is in, so the dead-camera confusion cannot recur.
 
 ## Constraints discovered (all verified against `types/v2/base.d.lua`)
 
@@ -36,17 +47,39 @@ These shaped the design more than any preference did.
 
 ## Architecture
 
-An overlay script with `alwaysTick = true`. Seven files, each with one job:
+A script with `alwaysTick = true`. Eight files, each with one job:
 
 | File | Responsibility | Depends on |
 |---|---|---|
 | `main.luau` | lifecycle, config defaults, arena selection, event routing, GUI | all |
 | `match.luau` | live state for one gamemode slot: arena transform, team names/colours/scores, goal positions, ball, goal/kickoff events | `util` |
-| `logos.luau` | logo quads: file scan, texture load, placement, `wanted.json` | `util` |
+| `sideline.luau` | ball-following sideline camera; no-ops unless it owns the camera | `util` |
+| `scoreboard.luau` | logo quads: file scan, texture load, placement, `wanted.json` | `util` |
 | `particles.luau` | pooled mesh particle engine + self-test | `util` |
 | `effects.luau` | the actual VFX composed from the engine | `util`, `particles` |
 | `util.luau` | maths, colour conversion, name sanitising, config seeding | — |
 | `package.json` | manifest | — |
+
+**The logo module is called `scoreboard`, not `logos`.** `require("logos")` resolves to the
+`logos/` *asset folder* and looks for `logos/init.lua`. Caught by the type checker, not by
+reading the code.
+
+### Sideline camera
+
+Geometry follows yuki's [od-sideline-cam](https://github.com/vrdeeznuts/od-sideline-cam):
+project the ball into the arena frame to get width/length/height offsets, dolly along the
+touchline tracking the ball's length position, switch sides with a hysteresis threshold,
+rise quadratically and hook inward near the endzones, raycast down to stay above the floor,
+and lead the aim by ball velocity. Hard cut on a side switch, so the dolly never sweeps
+through the middle of play.
+
+One deliberate departure: that script hardcodes arena centres and slot ids, which its author
+named the hardest part to maintain. This one derives the frame from the gamemode's own
+`ModuleStateSpectatorLuaApi.transform`, so it needs no per-arena table and works on any
+arena the client reports, Ares servers included.
+
+With no ball present it frames the arena centre rather than doing nothing, so selecting an
+arena always visibly moves the camera.
 
 `match.luau` is a lean rewrite rather than a copy of Plutus's `arena`/`box`/`gamemodes`
 trio: `require` is package-scoped so cross-package reuse is impossible anyway, and this
@@ -111,16 +144,44 @@ a single-frame ball velocity delta over a threshold.
 
 All counts scale with one `intensity` slider; each effect has an on/off toggle.
 
+## Team names are not ODC team names
+
+Observed live, from `wanted.json` written by a real session:
+
+```json
+{ "slotId": "Beta 01", "teams": ["Ceres Cobs", "Ceres Cobs"] }
+```
+
+`teamColor.teamName` is the **in-game** team name, and an ordinary lobby reports the *same*
+name for both sides. Consequences, all handled:
+
+- auto-matching a crest per side is impossible in that case, so the GUI warns and the manual
+  override becomes the primary path rather than a fallback;
+- `wanted.json` deduplicates names and carries an `ambiguous` flag;
+- `"Beta 01"` classifies as 4v4, confirming the slot-id heuristic borrowed from Plutus.
+
 ## Verification
+
+**Checked by tooling:** `check.ps1` runs `luau-lsp analyze` over every module with the
+install's `types/v2/*.d.lua` loaded — full type checking against the real engine API, clean
+apart from two intentional `alwaysTick` writes that are allowlisted by name. Two flags are
+load-bearing and non-obvious: `--no-flags-enabled` (luau-lsp enables all FFlags by default,
+which turns on the new type solver, which rejects the `declare class ... end` syntax the
+shipped definition files use — without it every engine global reads as unknown) and
+`--base-luaurc` pointed at the shipped `.luaurc` (which disables the `FunctionUnused` lint
+that otherwise fires on `main`/`tick`/`onGui`).
+
+That check found two defects that would each have broken the script on load, neither of
+which was visible by reading the code: the `require("logos")` folder collision, and a UTF-8
+BOM that a PowerShell `Set-Content -Encoding utf8` injected at byte 0 of `main.luau`.
 
 **Verified by running it:** `get-logos.ps1` against the live ODC API (769 teams indexed,
 logos downloaded and re-encoded, stem sanitising checked against a symbol-bearing team
-name), `make-sprites.ps1` (three valid 256×256 ARGB PNGs), and a bracket/keyword balance
-check over all six Luau files.
+name), `make-sprites.ps1` (three valid 256×256 ARGB PNGs), and `sync.ps1` into the real
+Behaviors folder.
 
-**Not verified:** everything that needs the game running. The Luau has never been parsed
-by the real interpreter, no mesh has been drawn, and the light intensity units are a
-guess. Specifically unknown until tested in-game:
+**Not verified:** anything requiring a rendered frame. No mesh has been drawn, no logo
+placed, no explosion seen. Specifically unknown until tested in-game:
 
 - default logo slot positions — they are *deliberately* placeholder, meant to be visible
   enough to find and drag into place;
@@ -135,18 +196,30 @@ vertex counts, and pool acquire/release accounting.
 `SpectatorDebug.goalExplosions` exists as a manual trigger, and the VFX tab has
 **Test goal explosion** / **Test kickoff** buttons, so nothing requires an actual match.
 
-## Install
+## Tooling
 
-Copy `fairy.casterfx/` into `…/Another-Axiom/A2/Cameras/Behaviors/`. On this machine
-Documents is OneDrive-redirected, so that is
-`C:\Users\tibba\OneDrive\Documents\Another-Axiom\A2\Cameras\Behaviors\`.
+| Script | Purpose |
+|---|---|
+| `check.ps1` | type-check every module against the game's definitions; downloads luau-lsp into `tools/` on first run |
+| `sync.ps1` | copy the package into the Behaviors folder; `-Watch` re-syncs on save, and combined with hot-reload that means saving here updates the running camera |
+| `get-logos.ps1` | fetch crests from the ODC API; `-Watch` follows `wanted.json` |
+| `make-sprites.ps1` | regenerate the particle sprites |
 
-Scripts hot-reload on save. `F2` to activate or bind, `F3` for this camera's panel,
-`F4` for Camera Logs.
+`sync.ps1` copies by extension whitelist and prunes stale `.luau` modules. Both matter:
+other tooling drops junk into working directories (this repo collected empty files named
+`0`, `900` and `0.999`), an earlier version replicated all of it into the game folder, and
+the renamed `logos.luau` lingered there as a second copy of a module.
+
+Documents is OneDrive-redirected on this machine, so the target is
+`C:\Users\tibba\OneDrive\Documents\Another-Axiom\A2\Cameras\Behaviors\`. `sync.ps1` checks
+both locations.
+
+`F2` to activate or bind, `F3` for this camera's panel, `F4` for Camera Logs.
 
 ## Deliberately not built
 
-- An autocam (Plutus has one).
+- A sewer cam, and the auto-clipping hotkey integration — both in od-sideline-cam, neither
+  asked for here.
 - A general particle *editor* with curves, sub-emitters, and atlases. The engine is
   reusable, but the full library Brick_Rage12 described is its own project.
 - Player outlines or highlights, ball outlines, speech bubbles — separate asks from the
