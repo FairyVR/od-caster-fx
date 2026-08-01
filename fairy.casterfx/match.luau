@@ -77,6 +77,23 @@ function Match.listAll()
     return out
 end
 
+-- Carry volatile detection state across a rebuild of the same slot. refreshMatches runs
+-- whenever the station's slot count changes -- observed 17 times in 65 seconds -- and each
+-- rebuild otherwise reseeds goal and kickoff detection, swallowing an event that lands on
+-- that frame. The api handle is deliberately NOT carried: getting a fresh one is the whole
+-- reason for rebuilding, and a stale handle is exactly what to avoid.
+function Match:carryOverFrom(old)
+    if old == nil or old.slotId ~= self.slotId then return end
+    self.primed = old.primed
+    self.isRunning = old.isRunning
+    self.wasRunning = old.wasRunning
+    self.ball = old.ball
+    for _, pair in { { self.home, old.home }, { self.away, old.away } } do
+        pair[1].score = pair[2].score
+        pair[1].previousScore = pair[2].previousScore
+    end
+end
+
 function Match:teamRotation(teamIndex)
     if teamIndex == Util.TeamIndex.HomeTeam then return self.transform.rotation * HOME_ROT end
     return self.transform.rotation * AWAY_ROT
@@ -136,6 +153,12 @@ function Match:tick()
     self.isRunning = data.isGameRunning == true
     self.timeSeconds = data.timeSeconds or 0
 
+    -- Before the priming return, not after it. Finding the ball has nothing to do with
+    -- seeding goal detection, and leaving it below meant every rebuilt Match reported no
+    -- ball for one frame -- which reset the trail and, because prevBallVelocity went to
+    -- zero, fired a phantom impact ring the very next frame.
+    self.ball = self:findBall()
+
     if not self.primed then
         -- Seed on the first tick so a script reload mid-match doesn't fire phantom goals.
         self.home.previousScore = self.home.score
@@ -161,8 +184,6 @@ function Match:tick()
     if self.isRunning and not self.wasRunning then
         table.insert(self.events, { kind = "kickoff", position = self.transform.position })
     end
-
-    self.ball = self:findBall()
 end
 
 return Match

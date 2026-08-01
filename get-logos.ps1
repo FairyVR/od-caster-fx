@@ -21,6 +21,17 @@
     detected in the live match) and fetch whatever appears there. Leave this running
     during a broadcast and logos arrive without you typing anything.
 
+.PARAMETER FromSchedule
+    List the scheduled ODC matches and fetch both crests for the one you pick, written as
+    HOME.png / AWAY.png. This is the most reliable mode: the in-game teamName is the
+    station's lobby name rather than the ODC one, so name matching often cannot work at all.
+
+.PARAMETER Week
+    Restrict -FromSchedule to one week number.
+
+.PARAMETER AllLeagues
+    Include leagues that are not in_progress in the -FromSchedule list.
+
 .PARAMETER Refresh
     Re-download the team index instead of using the local cache.
 
@@ -29,6 +40,9 @@
 
 .EXAMPLE
     .\get-logos.ps1 -Watch
+
+.EXAMPLE
+    .\get-logos.ps1 -FromSchedule
 #>
 [CmdletBinding()]
 param(
@@ -39,6 +53,9 @@ param(
     [switch] $Refresh,
     [switch] $ListMatches,
     [switch] $FromBridge,
+    [switch] $FromSchedule,
+    [switch] $AllLeagues,
+    [int]    $Week = 0,
 
     [string] $PackagePath = (Join-Path $PSScriptRoot 'fairy.casterfx'),
     [int]    $Size = 512,
@@ -48,7 +65,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
-$ApiBase = 'https://oriondriftcompetitive.com/api/v1/teams'
+$ApiRoot = 'https://oriondriftcompetitive.com/api/v1'
+$ApiBase = "$ApiRoot/teams"
 $UserAgent = 'fairy.casterfx-logo-fetch/1.0'
 $CachePath = Join-Path $PSScriptRoot '.odc-teams-cache.json'
 $LogoDir = Join-Path $PackagePath 'logos'
@@ -71,6 +89,31 @@ function Get-Stem {
     $out = $sb.ToString()
     if ($out.Length -eq 0) { return 'TEAM' }
     return $out
+}
+
+# GET /teams supports a server-side `search` (case-insensitive substring), so a single named
+# lookup does not need the whole 777-team index. Falls back to the cached index when search
+# returns nothing, since search only matches the ODC name and callers may pass a stem.
+function Find-TeamRemote {
+    param([string] $Query)
+    if ([string]::IsNullOrWhiteSpace($Query)) { return $null }
+    try {
+        $url = "$ApiBase`?search=$([uri]::EscapeDataString($Query))&limit=25"
+        $resp = Invoke-RestMethod -Uri $url -UserAgent $UserAgent -TimeoutSec 30
+    } catch {
+        return $null
+    }
+    if (-not $resp.data -or $resp.data.Count -eq 0) { return $null }
+
+    $exact = $resp.data | Where-Object { $_.name -and $_.name.ToUpperInvariant() -eq $Query.ToUpperInvariant() }
+    if ($exact) { return @($exact)[0] }
+    $wantStem = Get-Stem $Query
+    $byStem = $resp.data | Where-Object { $_.name -and (Get-Stem $_.name) -eq $wantStem }
+    if ($byStem) { return @($byStem)[0] }
+    if ($resp.data.Count -eq 1) { return $resp.data[0] }
+    Write-Warning ("'{0}' is ambiguous on the server. Candidates: {1}" -f $Query,
+        (($resp.data | Select-Object -First 8 | ForEach-Object { $_.name }) -join ', '))
+    return $null
 }
 
 function Get-TeamIndex {
@@ -103,6 +146,11 @@ function Get-TeamIndex {
 
 function Find-Team {
     param($Index, [string] $Query)
+
+    # Server-side search first: it is one request instead of paging 777 teams, and it stays
+    # correct when a team is created after the local cache was written.
+    $remote = Find-TeamRemote -Query $Query
+    if ($remote) { return $remote }
 
     $exact = $Index | Where-Object { $_.name -and $_.name.ToUpperInvariant() -eq $Query.ToUpperInvariant() }
     if ($exact) { return @($exact)[0] }
@@ -236,6 +284,98 @@ function Import-FromBridge {
     return $imported
 }
 
+# The reliable path. GET /leagues and GET /leagues/{id}/matches are both public, and a match
+# arrives with team1Id/team2Id already populated (name + profilePicture). That sidesteps the
+# whole problem that made name matching unreliable: the in-game teamName is the station's
+# lobby name, not the ODC one -- "predators", "Kaiju!" and "samurais" from real captures all
+# return zero hits against /teams. Picking the scheduled match is unambiguous by construction,
+# and it knows which side is which, so it can write HOME.png / AWAY.png directly.
+function Get-Leagues {
+    $resp = Invoke-RestMethod -Uri "$ApiRoot/leagues?limit=25" -UserAgent $UserAgent -TimeoutSec 30
+    return @($resp.data)
+}
+
+function Get-Matches {
+    param([string] $LeagueId, [int] $Week, [int] $Limit = 50)
+    $url = "$ApiRoot/leagues/$LeagueId/matches?limit=$Limit"
+    if ($Week -gt 0) { $url += "&weekNumber=$Week" }
+    $resp = Invoke-RestMethod -Uri $url -UserAgent $UserAgent -TimeoutSec 30
+    return @($resp.data)
+}
+
+function Save-TeamLogo {
+    param($TeamObj, [string] $Side)
+    if (-not $TeamObj) { return $false }
+    if (-not $TeamObj.profilePicture) {
+        Write-Warning ("'{0}' has no logo uploaded on ODC." -f $TeamObj.name)
+        return $false
+    }
+    try {
+        $resp = Invoke-WebRequest -Uri $TeamObj.profilePicture -UserAgent $UserAgent -TimeoutSec 30 -UseBasicParsing
+    } catch {
+        Write-Warning ("Failed to fetch logo for '{0}': {1}" -f $TeamObj.name, $_.Exception.Message)
+        return $false
+    }
+    $stem = Get-Stem $TeamObj.name
+    Save-SquarePng -Bytes $resp.Content -Path (Join-Path $LogoDir "$stem.png") -Edge $Size
+    if ($Side) {
+        # HOME.png / AWAY.png is what the camera prefers, because it is unambiguous even when
+        # both sides report the same in-game team name.
+        Save-SquarePng -Bytes $resp.Content -Path (Join-Path $LogoDir "$Side.png") -Edge $Size
+        Write-Host ("  {0,-4} {1}  ->  logos\{2}.png + {3}.png" -f $Side, $TeamObj.name, $Side, $stem) -ForegroundColor Green
+    } else {
+        Write-Host ("  {0}  ->  logos\{1}.png" -f $TeamObj.name, $stem) -ForegroundColor Green
+    }
+    return $true
+}
+
+function Show-MatchPicker {
+    param([int] $Week)
+
+    $leagues = Get-Leagues
+    if ($leagues.Count -eq 0) { Write-Warning 'No leagues returned.'; return }
+
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($lg in $leagues) {
+        if ($lg.status -ne 'in_progress' -and -not $AllLeagues) { continue }
+        foreach ($m in (Get-Matches -LeagueId $lg._id -Week $Week)) {
+            if (-not $m.team1Id -or -not $m.team2Id) { continue }
+            [void] $rows.Add([pscustomobject]@{
+                League = $lg.name
+                Week   = $m.weekNumber
+                State  = $m.state
+                Home   = $m.team1Id
+                Away   = $m.team2Id
+            })
+        }
+    }
+    if ($rows.Count -eq 0) {
+        Write-Warning 'No matches found. Try -Week <n>, or -AllLeagues for finished seasons.'
+        return
+    }
+
+    $sorted = $rows | Sort-Object Week, League
+    Write-Host ''
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        $r = $sorted[$i]
+        Write-Host ("  [{0,3}] wk{1,-3} {2,-14} {3}  vs  {4}   ({5})" -f `
+            ($i + 1), $r.Week, $r.League, $r.Home.name, $r.Away.name, $r.State)
+    }
+    Write-Host ''
+    $pick = Read-Host 'Match number to fetch (blank to cancel)'
+    if ([string]::IsNullOrWhiteSpace($pick)) { return }
+    $n = 0
+    if (-not [int]::TryParse($pick, [ref] $n) -or $n -lt 1 -or $n -gt $sorted.Count) {
+        Write-Warning 'Not a listed number.'
+        return
+    }
+    $r = $sorted[$n - 1]
+    Write-Host ("Fetching {0} vs {1}..." -f $r.Home.name, $r.Away.name) -ForegroundColor Cyan
+    [void] (Save-TeamLogo -TeamObj $r.Home -Side 'HOME')
+    [void] (Save-TeamLogo -TeamObj $r.Away -Side 'AWAY')
+    Write-Host '  done -- press "Rescan logos/ folder" in the camera GUI.' -ForegroundColor Green
+}
+
 function Read-Wanted {
     $path = Join-Path $PackagePath 'wanted.json'
     if (-not (Test-Path $path)) { return @() }
@@ -258,6 +398,11 @@ if (-not (Test-Path $LogoDir)) {
     Write-Host "Created $LogoDir"
 }
 
+if ($FromSchedule) {
+    Show-MatchPicker -Week $Week
+    if (-not $Watch) { return }
+}
+
 if ($FromBridge) {
     Write-Host "Importing logos from OD Caster Bridge..." -ForegroundColor Cyan
     $n = Import-FromBridge
@@ -268,7 +413,7 @@ if ($FromBridge) {
 
 # The ODC index is only needed for name-based fetching, so don't pay for it in -FromBridge runs.
 $index = @()
-if (-not $FromBridge) { $index = Get-TeamIndex -Force:$Refresh }
+if (-not $FromBridge -and -not $FromSchedule) { $index = Get-TeamIndex -Force:$Refresh }
 
 if ($ListMatches) {
     foreach ($q in $Team) {

@@ -4,6 +4,10 @@ fairy.casterfx/logos/
 # Written by the camera script, consumed by get-logos.ps1 -Watch
 fairy.casterfx/wanted.json
 
+# Captured game data -- run output, regenerable, and can reach megabytes
+fairy.casterfx/gamedata-log.json
+fairy.casterfx/diagnostics.json
+
 # ODC team index cache
 .odc-teams-cache.json
 
@@ -19,3 +23,8 @@ tools/
 /[0-9]*
 /fairy.casterfx/[0-9]*
 /yaw
+/interval
+/lastCap
+/saved
+/team.previousScore
+/Particles.maxLights

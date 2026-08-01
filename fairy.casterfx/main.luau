@@ -17,14 +17,43 @@ local Match = require("match")
 local Profiles = require("profiles")
 -- "scoreboard", not "logos": require("logos") resolves to the logos/ asset folder.
 local Scoreboard = require("scoreboard")
+local Models = require("models")
 local Particles = require("particles")
+local CCFX = require("ccfx")
 local Effects = require("effects")
 local Sideline = require("sideline")
 local Freecam = require("freecam")
 local Diagnostics = require("diagnostics")
+local Recorder = require("recorder")
 
 Util.initializeConfig({
     logosEnabled = true,
+    modelsEnabled = true,
+    -- "ccfx" = the ported CasterCamera particle system (known to work in game).
+    -- "hdr"  = this package's own line engine.
+    fxEngine = "ccfx",
+    ccfxVibrance = 8,
+    ccfxCollide = true,
+    -- Shrink the real game ball away when a model is standing in for it. Global to the
+    -- replay, so Models restores it on unload.
+    hideRealBall = true,
+    ballScale = 1,
+    previewGoalOutline = false,
+    -- filename -> saved transform, so an imported .glb lands correctly everywhere.
+    modelPresets = {},
+    -- Recorder: off by default, it writes to disk on a timer while running.
+    logEnabled = false,
+    logHz = 10,
+    logMaxSamples = 600,
+    logRolling = true,
+    logFlushSeconds = 3,
+    logBall = true,
+    logAllBalls = false,
+    logTeams = true,
+    logCamera = true,
+    logArena = true,
+    logPlayers = false,
+    logFraming = true,
     writeWanted = true,
     autoSelectArena = true,
     autoBindProfile = true,
@@ -44,7 +73,12 @@ local lastSlotCount = -1
 local refreshTimer = 99
 local wantedTimer = 0
 local prevBallVelocity = Vec3.zeroVector
+local prevBallPosition = nil
 local lastImpactTime = -99
+
+-- Measured from a real match capture: ball speed is hard-clamped at exactly 1900 cm/s
+-- (7 samples above 1850, none above 1900.000000). Used to tell movement from a respawn.
+local BALL_SPEED_CAP = 1900
 local totalTime = 0
 local selfTestResult = ""
 local newProfileName = ""
@@ -84,12 +118,25 @@ local function pushSettings()
     Particles.sizeScale = v.sizeScale
     Particles.maxParticles = math.floor(v.maxParticles)
 
+    CCFX.vibrance = config.ccfxVibrance
+    CCFX.speed = v.simSpeed
+    CCFX.collide = config.ccfxCollide
+
     local s = Effects.settings
+    s.engine = nil                       -- engine lives on Effects, not per profile
+    Effects.engine = config.fxEngine
     s.intensity = v.intensity
     s.hdrBoost = v.hdrBoost
     s.trailLength = v.trailLength
     s.trailBoost = v.trailBoost
     s.goalEnabled = v.goalEnabled
+    s.goalOutline = v.goalOutline
+    s.goalOutlineRoll = v.goalOutlineRoll
+    s.goalOutlinePitch = v.goalOutlinePitch
+    s.goalOutlineYaw = v.goalOutlineYaw
+    s.goalOutlineX = v.goalOutlineX
+    s.goalOutlineY = v.goalOutlineY
+    s.goalOutlineZ = v.goalOutlineZ
     s.goalShockwaves = v.goalShockwaves
     s.goalDebris = v.goalDebris
     s.goalSparks = v.goalSparks
@@ -135,9 +182,14 @@ local function refreshMatches(force)
     if not force and count == lastSlotCount then return end
     lastSlotCount = count
     local previousId = selected and selected.slotId or nil
+    local existing = {}
+    for _, m in matches do existing[m.slotId] = m end
     matches = Match.listAll()
     selected = nil
     for i, m in matches do
+        -- Keep score/priming continuity for slots we already had, so a rebuild cannot
+        -- swallow a goal or kickoff that lands on this frame.
+        m:carryOverFrom(existing[m.slotId])
         if m.slotId == previousId then selectIndex(i) end
     end
     if selected == nil then selectIndex(1) end
@@ -189,6 +241,7 @@ function main()
     Freecam.moveSpeed = config.freecamSpeed
     pushSettings()
     Scoreboard.rescan()
+    Models.rescan()
     refreshMatches(true)
 end
 
@@ -202,12 +255,18 @@ function onConfigChanged()
 end
 
 function onUnload()
+    -- Flush first: the buffer is memory-only, so unloading mid-recording would lose it all.
+    if Recorder.isRecording() then Recorder.flush() end
+    CCFX.clear()
     Particles.destroyAll()
     Scoreboard.destroy()
+    Models.destroy()
 end
 
 function tick(dt)
     totalTime += dt
+    -- Before anything that can call Recorder.note, so events are stamped with this frame.
+    Recorder.advance(dt)
     pushSettings()
 
     -- Lines are redrawn every frame, so the clear has to happen before anything draws.
@@ -222,6 +281,7 @@ function tick(dt)
 
     if selected == nil then
         guard("particles", Particles.update, dt)
+        guard("ccfx", CCFX.update, dt)
         return
     end
 
@@ -245,9 +305,14 @@ function tick(dt)
                 print(("casterfx: goal #%d by %s at %s"):format(
                     goalEventCount, event.team.name ~= "" and event.team.name or "?",
                     tostring(event.position)))
-                Effects.goalExplosion(event.position, event.rotation, event.team.color)
+                Recorder.note("goal", ("%s at %s"):format(
+                    event.team.name ~= "" and event.team.name or "?", tostring(event.position)))
+                Effects.goalExplosion(event.position, event.rotation, event.team.color,
+                    selected.transform.rotation)
             elseif event.kind == "kickoff" then
-                Effects.kickoffBurst(event.position, selected.home.color, selected.away.color)
+                Recorder.note("kickoff", tostring(event.position))
+                Effects.kickoffBurst(event.position, selected.home.color, selected.away.color,
+                    selected.transform.rotation)
             end
         end
     end)
@@ -256,24 +321,55 @@ function tick(dt)
         local ball = selected.ball
         local trailColor = possessionColor(selected)
         if ball then
+            local pos = ball.transform.position
             local vel = ball.velocity or Vec3.zeroVector
-            Effects.ballTrail(dt, ball.transform.position, vel, trailColor)
+
+            -- The engine hard-caps ball speed at 1900 cm/s (measured: 7 samples above 1850,
+            -- none above 1900.000000). So a jump further than that in one frame is not
+            -- movement, it is a respawn -- after a goal, or a round reset. Treating it as a
+            -- hit fired an impact ring in the middle of the goal celebration, and the trail
+            -- drew one long streak across the whole arena to the new position.
+            local jump = prevBallPosition and Util.dist(prevBallPosition, pos) or 0
+            local teleported = prevBallPosition ~= nil
+                and jump > BALL_SPEED_CAP * dt * 2 + 200
+            prevBallPosition = pos
+
+            if teleported then
+                Recorder.note("ballReset", ("jumped %.0f cm in one frame"):format(jump))
+                Effects.resetTrail()
+                prevBallVelocity = vel
+                return
+            end
+
+            Effects.ballTrail(dt, pos, vel, trailColor)
             -- A large velocity change in one frame is a hit, a wall, or a save.
             local delta = (vel - prevBallVelocity):length()
             local threshold = Profiles.active().vfx.impactThreshold
             if delta > threshold and totalTime - lastImpactTime > 0.15 then
                 lastImpactTime = totalTime
-                Effects.impactRing(ball.transform.position,
-                    (vel - prevBallVelocity):getSafeNormal(), trailColor)
+                -- Logged so a capture can prove these are real hits. They used to fire on a
+                -- ~3s cadence from prevBallVelocity being reset by the ball-nil bug; evenly
+                -- spaced impacts in a recording would mean that regressed.
+                Recorder.note("impact", ("delta %.0f cm/s (threshold %.0f)")
+                    :format(delta, threshold))
+                Effects.impactRing(pos, (vel - prevBallVelocity):getSafeNormal(), trailColor)
             end
             prevBallVelocity = vel
         else
             Effects.resetTrail()
             prevBallVelocity = Vec3.zeroVector
+            prevBallPosition = nil
         end
     end)
 
     guard("scoreboard", Scoreboard.update, selected, config.logosEnabled)
+    guard("models", Models.update, selected, config.modelsEnabled)
+    guard("recorder", Recorder.tick, dt, selected)
+
+    -- Redrawn every frame because lines are cleared every frame.
+    if config.previewGoalOutline then
+        guard("outline preview", Effects.previewGoalOutline, selected)
+    end
 
     if config.writeWanted then
         wantedTimer += dt
@@ -284,6 +380,7 @@ function tick(dt)
     end
 
     guard("particles", Particles.update, dt)
+    guard("ccfx", CCFX.update, dt)
 end
 
 --------------------------------------------------------------------------------
@@ -396,7 +493,9 @@ local function cameraTab()
 end
 
 local function slotEditor(index, slot)
-    if not Gui.treeNode(string.format("%d. %s##slot%d", index, slot.name, index)) then return end
+    -- "###" not "##": "##" leaves the visible text in the ID hash, so editing the label below
+    -- would change this node's ID every keystroke and kick focus out of the box each character.
+    if not Gui.treeNode(string.format("%d. %s###slot%d", index, slot.name, index)) then return end
 
     slot.name = Gui.inputText("Label##" .. index, slot.name)
     slot.enabled = Gui.checkbox("Show##" .. index, slot.enabled)
@@ -505,6 +604,13 @@ local function logosTab()
     if Gui.button(Icon.Undo .. " Reset all slots") then
         Profiles.resetSlots(selected.type, selected.arenaHeight)
     end
+    Gui.sameLine()
+    if Gui.button(Icon.Copy .. " Use as template for other arenas") then
+        if Profiles.saveReference(selected.type, selected.arenaHeight) then
+            print("casterfx: saved " .. tostring(selected.type) .. " slots as the reference"
+                .. " template -- new arena types will scale from these by height ratio")
+        end
+    end
 
     if Gui.button(Icon.Save .. " Save placement") then
         if saveConfig() then print("casterfx: placement saved") end
@@ -513,6 +619,31 @@ end
 
 local function vfxTab()
     local v = Profiles.active().vfx
+
+    Gui.separatorText("Particle engine")
+    if Gui.beginCombo("Engine", config.fxEngine == "ccfx"
+        and "CasterCamera port (known good)" or "HDR lines (this package)") then
+        if Gui.selectable("CasterCamera port (known good)", config.fxEngine == "ccfx") then
+            config.fxEngine = "ccfx"
+        end
+        if Gui.selectable("HDR lines (this package)", config.fxEngine == "hdr") then
+            config.fxEngine = "hdr"
+        end
+        Gui.endCombo()
+    end
+    if config.fxEngine == "ccfx" then
+        config.ccfxVibrance = Gui.sliderFloat("Vibrance (bloom)", config.ccfxVibrance, 1, 20)
+        config.ccfxCollide = Gui.checkbox("Embers bounce off geometry", config.ccfxCollide)
+        Gui.setItemTooltip("One raycast per ember per frame -- 300 of them during a goal. "
+            .. "Turn off if a celebration costs frames.")
+        Gui.text("ccfx live: " .. CCFX.count() .. "   spawned: " .. CCFX.stats.spawned)
+        if Gui.button(Icon.Vial .. " Test ccfx burst in front of camera") then
+            CCFX.testBurst()
+        end
+        Gui.sameLine()
+        if Gui.button(Icon.Trash .. " Clear ccfx") then CCFX.clear() end
+    end
+    Gui.separator()
     v.enabled = Gui.checkbox("Enable VFX", v.enabled)
     v.intensity = Gui.sliderFloat("Intensity (counts)", v.intensity, 0.1, 3)
     v.sizeScale = Gui.sliderFloat("Size scale", v.sizeScale, 0.2, 6)
@@ -523,6 +654,46 @@ local function vfxTab()
 
     Gui.separatorText("Goal explosion")
     v.goalEnabled = Gui.checkbox("Goal explosion", v.goalEnabled)
+    v.goalOutline = Gui.checkbox("Goal-shaped outline blast", v.goalOutline)
+    Gui.setItemTooltip("Throws the goal's own silhouette out of the mouth as three expanding "
+        .. "shells, so the celebration reads as a goal and not a generic explosion.")
+    if v.goalOutline then
+        -- Live preview so the sliders can be judged against the real goal, rather than by
+        -- firing a test explosion and trying to read a 2 second effect.
+        config.previewGoalOutline = Gui.checkbox("Show outline on both goals now (preview)",
+            config.previewGoalOutline)
+        Gui.setItemTooltip("Draws the silhouette continuously at both goals. Fly the debug "
+            .. "freecam to a goal and line it up; the default should already be correct.")
+        if config.previewGoalOutline then
+            Gui.text("  Adjust only if the preview does not sit on the real goal:")
+            v.goalOutlineRoll = Gui.sliderFloat("Outline roll", v.goalOutlineRoll, -180, 180)
+            v.goalOutlinePitch = Gui.sliderFloat("Outline pitch", v.goalOutlinePitch, -180, 180)
+            v.goalOutlineYaw = Gui.sliderFloat("Outline yaw", v.goalOutlineYaw, -180, 180)
+            -- Arena frame: x runs down the pitch, y across it, z up.
+            v.goalOutlineX = Gui.dragFloat("Outline forward X", v.goalOutlineX, 2, -3000, 3000)
+            v.goalOutlineY = Gui.dragFloat("Outline right Y", v.goalOutlineY, 2, -3000, 3000)
+            v.goalOutlineZ = Gui.dragFloat("Outline up Z", v.goalOutlineZ, 2, -3000, 3000)
+            if Gui.button(Icon.Undo .. " Reset outline position and angles") then
+                v.goalOutlineRoll, v.goalOutlinePitch, v.goalOutlineYaw = 0, 0, 0
+                v.goalOutlineX, v.goalOutlineY, v.goalOutlineZ = 0, 0, 0
+            end
+            if selected and Freecam.isDriving() then
+                if Gui.button(Icon.MapMarkerAlt .. " Snap outline to where I'm looking") then
+                    local aim = Freecam.aimPoint(400)
+                    if aim then
+                        -- Solve the nudge that lands the home goal on the aim point, in the
+                        -- outline's own frame, rather than making you find it by dragging.
+                        local rot = selected.transform.rotation
+                            * Quat.fromEuler(v.goalOutlineRoll, v.goalOutlinePitch, v.goalOutlineYaw)
+                        local d = rot:inverse():rotateVector(aim - selected.home.goalPosition)
+                        v.goalOutlineX, v.goalOutlineY, v.goalOutlineZ = d.x, d.y, d.z
+                    end
+                end
+                Gui.setItemTooltip("Aim at the centre of the HOME goal mouth and click. "
+                    .. "The same offset is mirrored onto the away goal.")
+            end
+        end
+    end
     v.goalShockwaves = Gui.checkbox("Shockwave rings", v.goalShockwaves)
     v.goalDebris = Gui.checkbox("Debris shards", v.goalDebris)
     v.goalSparks = Gui.checkbox("Sparks", v.goalSparks)
@@ -544,6 +715,27 @@ local function vfxTab()
     -- effect never spawned. If it jumps but nothing is visible, it is a drawing problem.
     Gui.text("Particles live: " .. Particles.count()
         .. "   spawned since load: " .. Particles.stats.spawned)
+
+    -- "Lights but no particles" is ambiguous from the outside: it can be spawning blocked,
+    -- a paused sim, or the update loop dying before it draws. Each has a different tell, so
+    -- print all three rather than making anyone guess which one it is.
+    Gui.text(("engine: enabled=%s  simSpeed=%s  sizeScale=%s  budget=%d  lights=%d")
+        :format(tostring(Particles.enabled), tostring(Particles.simSpeed),
+            tostring(Particles.sizeScale), Particles.maxParticles, Particles.stats.lights))
+    if Particles.enabled == false then
+        Gui.textColored(LinearColor.new(1, 0.5, 0.5, 1),
+            "VFX is disabled -- nothing will spawn. Tick 'Enable VFX' at the top.")
+    elseif (Particles.simSpeed or 0) <= 0 then
+        Gui.textColored(LinearColor.new(1, 0.5, 0.5, 1),
+            "Sim speed is 0 -- particles are frozen and invisible. Raise 'Sim speed'.")
+    elseif Particles.count() > 0 and Particles.stats.live == 0 then
+        Gui.textColored(LinearColor.new(1, 0.5, 0.5, 1),
+            "Particles exist but the update loop is not finishing -- see Debug for the error.")
+    end
+    if lastError ~= "" then
+        Gui.textColored(LinearColor.new(1, 0.5, 0.5, 1), "Last error: " .. lastError)
+    end
+
     if selected == nil then
         Gui.textColored(LinearColor.new(1, 0.6, 0.3, 1),
             "No arena selected -- the goal and kickoff tests do nothing.")
@@ -553,7 +745,7 @@ local function vfxTab()
         if selected then
             local before = Particles.count()
             Effects.goalExplosion(selected.away.goalPosition, selected.away.goalRotation,
-                selected.home.color)
+                selected.home.color, selected.transform.rotation)
             print(("casterfx test goal: %d -> %d particles at %s"):format(
                 before, Particles.count(), tostring(selected.away.goalPosition)))
         else
@@ -562,7 +754,8 @@ local function vfxTab()
     end
     Gui.sameLine()
     if Gui.button(Icon.Rocket .. " Test kickoff") and selected then
-        Effects.kickoffBurst(selected.transform.position, selected.home.color, selected.away.color)
+        Effects.kickoffBurst(selected.transform.position, selected.home.color,
+            selected.away.color, selected.transform.rotation)
     end
     if Gui.button(Icon.Vial .. " Test burst in front of camera") then
         Particles.testBurst()
@@ -670,6 +863,9 @@ local function debugTab()
     end
     if selfTestResult ~= "" then Gui.text("Self-test: " .. selfTestResult) end
 
+    Gui.separatorText("Game data recorder")
+    Recorder.gui(selected)
+
     Gui.separatorText("Arenas")
     Gui.text("Detected: " .. #matches)
     config.autoSelectArena = Gui.checkbox("Auto-select nearest arena", config.autoSelectArena)
@@ -712,6 +908,11 @@ function onGui()
     end
     if Gui.beginTabItem(Icon.Image .. " Logos") then
         logosTab()
+        Gui.endTabItem()
+    end
+    if Gui.beginTabItem(Icon.Cube .. " Models") then
+        config.modelsEnabled = Gui.checkbox("Enable custom models", config.modelsEnabled)
+        Models.gui(selected)
         Gui.endTabItem()
     end
     if Gui.beginTabItem(Icon.Fire .. " VFX") then

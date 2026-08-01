@@ -8,12 +8,25 @@
 
 local Util = require("util")
 local Particles = require("particles")
+local CCFX = require("ccfx")
 
 local Effects = {}
+
+-- Which engine draws the goal and kickoff. "ccfx" is the ported CasterCamera system, which
+-- is known to work in game; "hdr" is this package's own line engine. Kept switchable so the
+-- two can be compared directly instead of argued about.
+Effects.engine = "ccfx"
 
 Effects.settings = {
     intensity = 1,
     goalEnabled = true,
+    goalOutline = true,
+    goalOutlineRoll = 0,
+    goalOutlinePitch = 0,
+    goalOutlineYaw = 0,
+    goalOutlineX = 0,
+    goalOutlineY = 0,
+    goalOutlineZ = 0,
     goalShockwaves = true,
     goalDebris = true,
     goalSparks = true,
@@ -54,14 +67,82 @@ end
 -- Goal
 --------------------------------------------------------------------------------
 
-function Effects.goalExplosion(position, rotation, colour)
+-- The outline's own axes are x = pitch/plane normal, y = width, z = height -- the same
+-- convention as the ARENA frame (compare ARENA_TYPES goalOffset, which is +x down the pitch
+-- and +z up). goalRotation is that frame yawed by 90 degrees, which is right for a ring
+-- normal but would stand the goal silhouette edge-on. So the outline uses the arena frame,
+-- and the sliders exist only for fine tuning on top of a default that should already be right.
+local function outlineFrame(arenaRotation, goalRotation)
+    local s = Effects.settings
+    local base = arenaRotation or goalRotation
+    return base * Quat.fromEuler(s.goalOutlineRoll, s.goalOutlinePitch, s.goalOutlineYaw)
+end
+
+-- goalPosition comes from a hardcoded per-arena-type offset, which is close but not exact for
+-- every map. The nudge is applied in the outline's own frame, so "forward" stays along the
+-- pitch and "up" stays up no matter how the arena is rotated.
+local function outlinePosition(position, rot)
+    local s = Effects.settings
+    return position + rot:rotateVector(
+        Vec3.new(s.goalOutlineX, s.goalOutlineY, s.goalOutlineZ))
+end
+
+-- Draws the silhouette at both goals every frame it is called, so the calibration sliders
+-- can be judged live instead of by triggering a goal and watching a 2 second effect.
+function Effects.previewGoalOutline(match)
+    if match == nil then return end
+    local rot = outlineFrame(match.transform.rotation, nil)
+    for _, team in { match.home, match.away } do
+        Particles.drawShape(Particles.goalOutline, outlinePosition(team.goalPosition, rot),
+            rot, 1, hdr(team.color, 12), 22)
+    end
+end
+
+function Effects.goalExplosion(position, rotation, colour, arenaRotation)
     local s = Effects.settings
     if not s.goalEnabled then return end
+
+    if Effects.engine == "ccfx" then
+        -- Their recipe expects the goal frame flipped 180 in yaw, and the outline sits in the
+        -- arena frame (x across the goal mouth), so build the same frames used by the preview.
+        local outlineRot = outlineFrame(arenaRotation, rotation)
+        CCFX.goalExplosion(outlinePosition(position, outlineRot), outlineRot, colour,
+            s.intensity, s.goalOutline)
+        if s.goalLights then
+            local lit = s.intensity * s.lightIntensity
+            Particles.flash(position, LinearColor.White, 30000 * lit, 3000, 0.35)
+            Particles.flash(position, colour, 50000 * lit, 5000, 0.9)
+        end
+        return
+    end
 
     local teamHdr = hdr(colour)
     local u = up()
     -- Rings sit in the plane of the goal mouth; forward is the goal's own facing.
     local goalForward = rotation:getForwardVector()
+
+    local dim = Vec3.new(teamHdr.x * 0.1, teamHdr.y * 0.1, teamHdr.z * 0.1)
+
+    -- The goal's own silhouette, blown out of the mouth as three shells at halving speeds.
+    -- This is the part that makes the celebration read as a GOAL: rings and embers alone are
+    -- a generic explosion that could be happening anywhere on the pitch.
+    if s.goalOutline then
+        local outlineRot = outlineFrame(arenaRotation, rotation)
+        local outlinePos = outlinePosition(position, outlineRot)
+        local speed = 1300
+        for i = 1, 3 do
+            Particles.spawn({
+                variant = "goalOutline",
+                position = outlinePos,
+                rotation = outlineRot,
+                velocity = goalForward * speed,
+                life = 1.0 + i * 0.4,
+                colourStart = i == 1 and whiteHot(55) or teamHdr,
+                colourEnd = dim,
+            })
+            speed /= 2
+        end
+    end
 
     if s.goalShockwaves then
         -- Three staggered rings read as a pulse train rather than one pop.
@@ -73,7 +154,7 @@ function Effects.goalExplosion(position, rotation, colour)
                 life = 0.55 + i * 0.3,
                 radius = 40,
                 colourStart = i == 1 and whiteHot(50) or teamHdr,
-                colourEnd = Vec3.new(teamHdr.x * 0.1, teamHdr.y * 0.1, teamHdr.z * 0.1),
+                colourEnd = dim,
             })
         end
         -- One flat on the floor, which is what sells scale on a wide shot.
@@ -86,8 +167,10 @@ function Effects.goalExplosion(position, rotation, colour)
         })
     end
 
+    -- Denser than the first pass. The reference throws 300 embers at a goal; 90 spread over
+    -- a 25m goal mouth is sparse enough to read as a few sparks rather than a blast.
     if s.goalDebris then
-        for _ = 1, count(90) do
+        for _ = 1, count(170) do
             local dir = Util.randomUnit()
             Particles.spawn({
                 variant = "goalEmber",
@@ -100,7 +183,7 @@ function Effects.goalExplosion(position, rotation, colour)
     end
 
     if s.goalSparks then
-        for _ = 1, count(60) do
+        for _ = 1, count(95) do
             Particles.spawn({
                 variant = "goalSpark",
                 position = position,
@@ -138,9 +221,16 @@ end
 -- Kickoff
 --------------------------------------------------------------------------------
 
-function Effects.kickoffBurst(position, homeColor, awayColor)
+function Effects.kickoffBurst(position, homeColor, awayColor, arenaRotation)
     local s = Effects.settings
     if not s.kickoffEnabled then return end
+
+    if Effects.engine == "ccfx" then
+        CCFX.kickoff(position, arenaRotation or Quat.identity, homeColor, awayColor,
+            s.intensity)
+        return
+    end
+
     local u = up()
 
     for i, colour in { homeColor, awayColor } do

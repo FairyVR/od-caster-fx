@@ -61,6 +61,19 @@ Profiles.vfxDefaults = {
     hdrBoost = 20,
 
     goalEnabled = true,
+    goalOutline = true,
+    -- Calibration for the goal silhouette. The outline geometry is measured in the goal's own
+    -- frame, but this package derives goalRotation differently from where the numbers came
+    -- from, and the shape is asymmetric top-to-bottom -- so a wrong frame reads as upside
+    -- down. Nobody can check that from the code, hence a knob rather than a fixed constant.
+    goalOutlineRoll = 0,
+    goalOutlinePitch = 0,
+    goalOutlineYaw = 0,
+    -- The per-arena-type goalOffset is close but not exact on every map, so the silhouette
+    -- gets its own nudge in the arena frame (x along the pitch, y across, z up).
+    goalOutlineX = 0,
+    goalOutlineY = 0,
+    goalOutlineZ = 0,
     goalShockwaves = true,
     goalDebris = true,
     goalSparks = true,
@@ -104,7 +117,32 @@ function Profiles.defaultSlot(index, side, arenaHeight)
     }
 end
 
-function Profiles.defaultSlots(arenaHeight)
+local function deepCopy(t)
+    local out = {}
+    for k, v in pairs(t) do
+        out[k] = typeof(v) == "table" and deepCopy(v) or v
+    end
+    return out
+end
+
+-- Scale a reference arena's dialed-in slots onto a differently-sized arena. Only x/y/z move;
+-- everything else (rotation, on-screen size, flips) carries over unchanged since those are
+-- about the logo image, not the arena.
+local function scaledFromReference(reference, arenaHeight)
+    local ratio = arenaHeight / reference.height
+    local slots = {}
+    for index, slot in reference.slots do
+        local copy = deepCopy(slot)
+        copy.x, copy.y, copy.z = slot.x * ratio, slot.y * ratio, slot.z * ratio
+        slots[index] = copy
+    end
+    return slots
+end
+
+function Profiles.defaultSlots(arenaHeight, reference)
+    if reference and typeof(reference.slots) == "table" and reference.height then
+        return scaledFromReference(reference, arenaHeight)
+    end
     local slots = {}
     for board = 1, SCOREBOARD_COUNT do
         for _, side in { "home", "away" } do
@@ -113,6 +151,16 @@ function Profiles.defaultSlots(arenaHeight)
         end
     end
     return slots
+end
+
+-- Capture the currently-tuned slots for one arena type as the template new arena types seed
+-- from, scaled by height ratio, instead of the generic placeholder positions.
+function Profiles.saveReference(arenaType, arenaHeight)
+    local p = Profiles.active()
+    local arena = p.arenas[arenaType or "unknown"]
+    if typeof(arena) ~= "table" or typeof(arena.slots) ~= "table" then return false end
+    p.reference = { height = arenaHeight, slots = deepCopy(arena.slots) }
+    return true
 end
 
 -- Fill in missing keys without touching values the user has already set.
@@ -173,13 +221,6 @@ function Profiles.create(name, copyFrom)
     if name == nil or name == "" or config.profiles[name] then return false end
     if copyFrom and config.profiles[copyFrom] then
         -- Deep copy, so editing the new profile cannot reach back into the old one.
-        local function deepCopy(t)
-            local out = {}
-            for k, v in pairs(t) do
-                out[k] = typeof(v) == "table" and deepCopy(v) or v
-            end
-            return out
-        end
         config.profiles[name] = deepCopy(config.profiles[copyFrom])
     else
         config.profiles[name] = Profiles.newProfile()
@@ -212,20 +253,77 @@ function Profiles.rename(from, to)
     return true
 end
 
+-- Both slots and models live side by side under the same arena-type entry, so getters must
+-- patch in their own key rather than replacing the whole entry (that would wipe the other).
+local function arenaEntry(p, arenaType)
+    local key = arenaType or "unknown"
+    if typeof(p.arenas[key]) ~= "table" then p.arenas[key] = {} end
+    return p.arenas[key]
+end
+
 -- Logo slots for one arena type within the active profile.
 function Profiles.slots(arenaType, arenaHeight)
     local p = Profiles.active()
-    local key = arenaType or "unknown"
-    if typeof(p.arenas[key]) ~= "table" or typeof(p.arenas[key].slots) ~= "table"
-        or #p.arenas[key].slots == 0 then
-        p.arenas[key] = { slots = Profiles.defaultSlots(arenaHeight) }
+    local arena = arenaEntry(p, arenaType)
+    if typeof(arena.slots) ~= "table" or #arena.slots == 0 then
+        arena.slots = Profiles.defaultSlots(arenaHeight, p.reference)
     end
-    return p.arenas[key].slots
+    return arena.slots
 end
 
 function Profiles.resetSlots(arenaType, arenaHeight)
     local p = Profiles.active()
-    p.arenas[arenaType or "unknown"] = { slots = Profiles.defaultSlots(arenaHeight) }
+    arenaEntry(p, arenaType).slots = Profiles.defaultSlots(arenaHeight, p.reference)
+end
+
+-- Custom .glb/.gltf model placements for one arena type, same arena-relative convention as
+-- logo slots (x/y/z and pitch/yaw/roll in the arena's local frame).
+--
+-- Module-level rather than built per call: Profiles.models runs this over every entry every
+-- frame to backfill keys, and rebuilding the table each time would allocate for nothing.
+Profiles.modelDefaults = {
+    file = "",
+    name = "Model",
+    enabled = true,
+    -- "arena" anchors to the arena frame (existing behaviour); "ball" anchors to a live
+    -- ball instead, so x/y/z/pitch/yaw/roll become ball-relative.
+    followMode = "arena",
+    -- Which ball, when followMode is "ball". -1 = whichever is closest to the arena
+    -- centre (what Match:findBall picks); otherwise a specific ReplayBall.index.
+    ballIndex = -1,
+    -- Measured from a real match: the ball tumbles at ~400 deg/s (median) about a stable
+    -- axis. Right for a prop, unreadable for a crest -- so following that spin is opt-out.
+    spinWithBall = true,
+    -- Billboard to the camera, same idea as the logo slots. Always readable.
+    faceCamera = false,
+    x = 0, y = 0, z = 200,
+    pitch = 0, yaw = 0, roll = 0,
+    scale = 100,
+    textureOverride = "",
+}
+
+function Profiles.defaultModel()
+    local out = {}
+    ensureShape(Profiles.modelDefaults, out)
+    return out
+end
+
+function Profiles.models(arenaType)
+    local p = Profiles.active()
+    local arena = arenaEntry(p, arenaType)
+    if typeof(arena.models) ~= "table" then arena.models = {} end
+    -- Backfill keys added after these entries were saved. Without this, a placement stored
+    -- before a new option existed hands nil to that option's GUI widget, which then writes
+    -- the wrong value back the first time it renders.
+    for _, entry in arena.models do
+        ensureShape(Profiles.modelDefaults, entry)
+    end
+    return arena.models
+end
+
+function Profiles.resetModels(arenaType)
+    local p = Profiles.active()
+    arenaEntry(p, arenaType).models = {}
 end
 
 function Profiles.bindingFor(slotId)

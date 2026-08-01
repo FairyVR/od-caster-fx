@@ -45,7 +45,7 @@ $dest = Join-Path $BehaviorsPath $name
 # Whitelist, not blacklist. Other tooling drops junk into working directories (this repo
 # has collected empty files named "0", "900" and "0.999"), and an earlier version of this
 # script cheerfully replicated all of it into the game folder.
-$allowedExtensions = @('.luau', '.json', '.png', '.jpg', '.jpeg')
+$allowedExtensions = @('.luau', '.json', '.png', '.jpg', '.jpeg', '.glb', '.gltf', '.bin')
 
 function Sync-Once {
     if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
@@ -53,7 +53,7 @@ function Sync-Once {
     foreach ($src in Get-ChildItem $PackagePath -Recurse -File) {
         $rel = $src.FullName.Substring($PackagePath.Length + 1)
         # Written by the camera in the game folder; syncing over them would clobber live data.
-        if ($rel -eq 'wanted.json' -or $rel -eq 'diagnostics.json') { continue }
+        if ($rel -eq 'wanted.json' -or $rel -eq 'diagnostics.json' -or $rel -eq 'gamedata-log.json') { continue }
         if ($allowedExtensions -notcontains $src.Extension.ToLowerInvariant()) { continue }
         if ($rel -split '[\\/]' | Where-Object { $_.StartsWith('.') }) { continue }
         $target = Join-Path $dest $rel

@@ -40,17 +40,46 @@ local lights = {}
 -- Variants: the emitter presets. HDR colours on purpose.
 --------------------------------------------------------------------------------
 
+-- The real outline of an Orion Drift goal mouth, in the goal's own frame: x is the plane
+-- normal, y is width (+/- 2.49m), z is height. Six points, five segments, deliberately open
+-- along the bottom because the goal is an arch and not a closed loop.
+--
+-- These are measured values taken from dennssen/CasterCamera, which is the only place this
+-- geometry is written down -- the API exposes a goal position and rotation but no shape.
+Particles.goalOutline = {
+    Vec3.new(0, -248.905, -52.404),
+    Vec3.new(0, -248.905, 109.223),
+    Vec3.new(0, -188.979, 172.762),
+    Vec3.new(0, 188.979, 172.762),
+    Vec3.new(0, 248.905, 109.223),
+    Vec3.new(0, 248.905, -52.404),
+}
+
 -- appearance:
---   "ember"  line from position along velocity -- streaks, sparks, debris
---   "ring"   expanding polyline circle facing `forward` -- shockwaves
---   "spark"  short fixed-length line along velocity -- bright fast chips
+--   "ember"   line from position along velocity -- streaks, sparks, debris
+--   "ring"    expanding polyline circle facing `forward` -- shockwaves
+--   "spark"   short fixed-length line along velocity -- bright fast chips
+--   "outline" a fixed point list swept by `rotation` and grown by `expand` -- the goal shape
 Particles.variants = {
+    -- Bigger and beefier than the first pass. The reference implementation runs its goal
+    -- rings out to 60m at ~90 thickness with 90 segments; at 2600cm/26/40 these read as a
+    -- thin polygon rather than a shockwave from a touchline camera.
     goalRing = {
         appearance = "ring",
         colourStart = Vec3.new(30, 30, 30),
         colourEnd = Vec3.new(6, 6, 6),
-        gravity = 0, drag = 0.985, growth = 2600,
-        thickness = 26, resolution = 40, collision = false,
+        gravity = 0, drag = 0.985, growth = 5200,
+        thickness = 55, resolution = 72, collision = false,
+    },
+    -- The goal's own silhouette, thrown out of the mouth. This is the piece that makes a
+    -- celebration read as "a goal" rather than "a generic explosion".
+    goalOutline = {
+        appearance = "outline",
+        shape = Particles.goalOutline,
+        colourStart = Vec3.new(36, 36, 36),
+        colourEnd = Vec3.new(5, 5, 5),
+        gravity = 0, drag = 1, growth = 0, expand = 1.6,
+        thickness = 34, collision = false,
     },
     -- streak: seconds of travel drawn as the line. minLength: floor in cm, so a slow or
     -- nearly stopped particle is still a visible dash rather than a point.
@@ -106,6 +135,17 @@ Particles.variants = {
 -- Drawing helpers
 --------------------------------------------------------------------------------
 
+-- A point-list shape swept into world space. Shared by the outline particle and the live
+-- preview, so what you line up in the preview is exactly what a goal throws.
+function Particles.drawShape(shape, position, rotation, scale, colour, thickness)
+    local previous = position + rotation:rotateVector(shape[1] * scale)
+    for k = 2, #shape do
+        local point = position + rotation:rotateVector(shape[k] * scale)
+        WorldDraw.drawLine(previous, point, colour.x, colour.y, colour.z, thickness, 0)
+        previous = point
+    end
+end
+
 -- Polyline circle in the plane whose normal is `direction`.
 local function drawCircle(position, radius, direction, colour, thickness, resolution)
     local normal = direction:getSafeNormal()
@@ -128,7 +168,9 @@ end
 -- Spawning
 --------------------------------------------------------------------------------
 
--- p: { variant, position, velocity, forward, life, radius, colourStart?, colourEnd?, count? }
+-- p: { variant, position, velocity, forward, rotation, life, radius,
+--      colourStart?, colourEnd?, count? }
+-- `rotation` is only used by "outline", which needs a full frame rather than just a normal.
 function Particles.spawn(p)
     if not Particles.enabled then return 0 end
     local preset = Particles.variants[p.variant]
@@ -152,6 +194,7 @@ function Particles.spawn(p)
             position = p.position,
             velocity = p.velocity or Vec3.zeroVector,
             forward = p.forward or Vec3.upVector,
+            rotation = p.rotation or Quat.identity,
             radius = (p.radius or 0) * Particles.sizeScale,
             thickness = preset.thickness * Particles.sizeScale,
             colourStart = p.colourStart or preset.colourStart,
@@ -166,6 +209,9 @@ function Particles.spawn(p)
 end
 
 function Particles.flash(position, colour, intensity, radius, life)
+    -- Respect the same switch spawn() does. Without this, turning VFX off produced the exact
+    -- confusing state of a goal that flashes light but emits nothing.
+    if not Particles.enabled then return nil end
     -- Hard cap. A stuck light is very visible and there is no way to enumerate lights we
     -- have lost track of, so never let the list grow unbounded.
     while #lights >= Particles.maxLights do
@@ -280,10 +326,38 @@ function Particles.lineProbe(seconds, farPosition)
         :format(farPosition and " + 1 at the goal" or "", seconds))
 end
 
+-- Lights are a display effect on a wall clock, not part of the particle simulation. This used
+-- to live at the BOTTOM of update(), past the `step <= 0` early return -- so a zero or missing
+-- simSpeed, or any error in the particle loop, left every light burning forever with nothing
+-- else drawing. Decay them first, on real dt, so they can never outlive their effect.
+local function updateLights(dt)
+    local li = 1
+    while li <= #lights do
+        local l = lights[li]
+        l.age += dt
+        if l.age >= l.life then
+            l.light:destroy()
+            lights[li] = lights[#lights]
+            table.remove(lights)
+        else
+            l.light.intensity = l.intensity * (1 - l.age / l.life) ^ 2
+            li += 1
+        end
+    end
+    Particles.stats.lights = #lights
+end
+
 function Particles.update(dt)
-    local step = dt * Particles.simSpeed
     if holdTimer > 0 then holdTimer = math.max(0, holdTimer - dt) end
-    if step <= 0 then return end
+    updateLights(dt)
+
+    -- A nil simSpeed would make `step` nil and throw on the first comparison, taking the whole
+    -- effect system down silently behind guard(). Treat a missing value as normal speed.
+    local step = dt * (Particles.simSpeed or 1)
+    if step <= 0 then
+        Particles.stats.live = #particles
+        return
+    end
 
     local up = gravity.strength > 0 and gravity.upDirection or Vec3.upVector
 
@@ -340,28 +414,20 @@ function Particles.update(dt)
                 -- Ease out, so the shockwave leaves fast and settles.
                 local radius = p.radius + (preset.growth * Particles.sizeScale) * Util.easeOutCubic(elapsed)
                 drawCircle(p.position, radius, p.forward, colour, thickness, preset.resolution or 32)
+            elseif preset.appearance == "outline" then
+                -- Swells as it travels, so the silhouette reads as an expanding shell of the
+                -- goal rather than a decal stuck on it.
+                local scale = (1 + (preset.expand or 0) * Util.easeOutCubic(elapsed))
+                    * Particles.sizeScale
+                Particles.drawShape(preset.shape, p.position, p.rotation, scale,
+                    colour, thickness)
             end
 
             i += 1
         end
     end
 
-    local li = 1
-    while li <= #lights do
-        local l = lights[li]
-        l.age += step
-        if l.age >= l.life then
-            l.light:destroy()
-            lights[li] = lights[#lights]
-            table.remove(lights)
-        else
-            l.light.intensity = l.intensity * (1 - l.age / l.life) ^ 2
-            li += 1
-        end
-    end
-
     Particles.stats.live = #particles
-    Particles.stats.lights = #lights
 end
 
 function Particles.clear()
@@ -418,8 +484,13 @@ function Particles.selfTest()
     end
 
     for name, v in pairs(Particles.variants) do
-        check(v.appearance == "ember" or v.appearance == "ring" or v.appearance == "spark",
+        check(v.appearance == "ember" or v.appearance == "ring" or v.appearance == "spark"
+            or v.appearance == "outline",
             name .. ": unknown appearance " .. tostring(v.appearance))
+        if v.appearance == "outline" then
+            check(typeof(v.shape) == "table" and #v.shape >= 2,
+                name .. ": outline needs a shape of at least two points")
+        end
         check(v.colourStart ~= nil and v.colourEnd ~= nil, name .. ": missing colour ramp")
         check(v.thickness and v.thickness > 0, name .. ": thickness must be positive")
         -- HDR is the point: a variant capped at 1 will look like a dull stick.
