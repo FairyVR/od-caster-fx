@@ -26,6 +26,11 @@
     HOME.png / AWAY.png. This is the most reliable mode: the in-game teamName is the
     station's lobby name rather than the ODC one, so name matching often cannot work at all.
 
+.PARAMETER AllTeams
+    Fetch every team that appears in the scheduled matches of the in-progress leagues, so the
+    in-game logos tab has the whole season to pick from. Names only -- there is no home/away
+    here, so it writes <STEM>.png and leaves HOME/AWAY to -FromSchedule.
+
 .PARAMETER Week
     Restrict -FromSchedule to one week number.
 
@@ -43,6 +48,9 @@
 
 .EXAMPLE
     .\get-logos.ps1 -FromSchedule
+
+.EXAMPLE
+    .\get-logos.ps1 -AllTeams
 #>
 [CmdletBinding()]
 param(
@@ -54,6 +62,7 @@ param(
     [switch] $ListMatches,
     [switch] $FromBridge,
     [switch] $FromSchedule,
+    [switch] $AllTeams,
     [switch] $AllLeagues,
     [int]    $Week = 0,
 
@@ -329,6 +338,43 @@ function Save-TeamLogo {
     return $true
 }
 
+# Every team in the season, not just the two in one match. The logos tab is a browser, so it
+# wants the whole set present up front -- the camera has no way to fetch on demand.
+# Teams are collected from the match schedule rather than GET /teams, because /teams is 777
+# rows of every squad ever registered and only the ones actually playing are worth the disk.
+function Get-AllLeagueLogos {
+    param([int] $Week)
+
+    $seen = @{}
+    foreach ($lg in (Get-Leagues)) {
+        if ($lg.status -ne 'in_progress' -and -not $AllLeagues) { continue }
+        foreach ($m in (Get-Matches -LeagueId $lg._id -Week $Week)) {
+            foreach ($t in @($m.team1Id, $m.team2Id)) {
+                if ($t -and $t.name -and -not $seen.ContainsKey($t.name)) { $seen[$t.name] = $t }
+            }
+        }
+    }
+    if ($seen.Count -eq 0) {
+        Write-Warning 'No teams found. Try -AllLeagues for finished seasons.'
+        return 0
+    }
+
+    Write-Host ("{0} teams to fetch into {1}" -f $seen.Count, $LogoDir) -ForegroundColor Cyan
+    $ok = 0
+    $skipped = 0
+    foreach ($name in ($seen.Keys | Sort-Object)) {
+        $stem = Get-Stem $name
+        if (Test-Path (Join-Path $LogoDir "$stem.png")) {
+            $skipped++
+            continue
+        }
+        if (Save-TeamLogo -TeamObj $seen[$name]) { $ok++ }
+    }
+    Write-Host ("{0} downloaded, {1} already present, {2} failed." -f `
+        $ok, $skipped, ($seen.Count - $ok - $skipped)) -ForegroundColor Green
+    return $ok
+}
+
 function Show-MatchPicker {
     param([int] $Week)
 
@@ -396,6 +442,12 @@ if (-not (Test-Path $PackagePath)) {
 if (-not (Test-Path $LogoDir)) {
     New-Item -ItemType Directory -Path $LogoDir | Out-Null
     Write-Host "Created $LogoDir"
+}
+
+if ($AllTeams) {
+    [void] (Get-AllLeagueLogos -Week $Week)
+    Write-Host '  Press "Rescan logos/ folder" in the camera GUI.'
+    if (-not $Watch) { return }
 }
 
 if ($FromSchedule) {
