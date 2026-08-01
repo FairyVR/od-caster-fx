@@ -70,6 +70,9 @@ local matches = {}
 local selected = nil
 local selectedIndex = 0
 local lastSlotCount = -1
+-- Set when the user picks an arena from the combo. autoSelect must never overrule a
+-- deliberate choice: in overlay mode it would otherwise drag the pick back every 3s.
+local manualArena = false
 local refreshTimer = 99
 local wantedTimer = 0
 local prevBallVelocity = Vec3.zeroVector
@@ -192,14 +195,23 @@ local function refreshMatches(force)
         m:carryOverFrom(existing[m.slotId])
         if m.slotId == previousId then selectIndex(i) end
     end
-    if selected == nil then selectIndex(1) end
+    -- The slot that was picked is gone, so the pick cannot be honoured and must not keep
+    -- autoSelect switched off for the rest of the session.
+    if selected == nil then
+        manualArena = false
+        selectIndex(1)
+    end
 end
 
 -- Whichever arena the camera is actually looking from. Beats making the user pick
 -- when a station hosts several courts. Skipped while we own the camera, since then the
 -- camera sits at the selected arena by construction and this could never move off it.
+--
+-- Skipped after a manual pick too. Without that, overlay mode (another camera active, so
+-- nothing drives ours) compares against a camera.position nobody has moved, which is
+-- parked near the first arena -- so every refresh dragged the user's choice back to it.
 local function autoSelect()
-    if #matches < 2 or Sideline.isDriving() or Freecam.isDriving() then return end
+    if manualArena or #matches < 2 or Sideline.isDriving() or Freecam.isDriving() then return end
     local pos = camera.position
     local bestIdx, bestDist = selectedIndex, math.huge
     for i, m in matches do
@@ -868,10 +880,20 @@ local function debugTab()
 
     Gui.separatorText("Arenas")
     Gui.text("Detected: " .. #matches)
-    config.autoSelectArena = Gui.checkbox("Auto-select nearest arena", config.autoSelectArena)
+    -- Re-ticking the box is how you ask for auto behaviour back after a manual pick.
+    local wantAuto = Gui.checkbox("Auto-select nearest arena", config.autoSelectArena)
+    if wantAuto and not config.autoSelectArena then manualArena = false end
+    config.autoSelectArena = wantAuto
+    if manualArena and config.autoSelectArena then
+        Gui.textColored(LinearColor.new(1, 0.8, 0.3, 1),
+            "Holding your pick -- re-tick the box above to auto-follow again.")
+    end
     if #matches > 0 and Gui.beginCombo("Arena", selected and selected.name or "-") then
         for i, m in matches do
-            if Gui.selectable(m.name, i == selectedIndex) then selectIndex(i) end
+            if Gui.selectable(m.name, i == selectedIndex) then
+                manualArena = true
+                selectIndex(i)
+            end
         end
         Gui.endCombo()
     end
